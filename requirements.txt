@@ -1,0 +1,33 @@
+# ============================================================
+# Document Comparison System — Python Dependencies
+# ============================================================
+# Install with:   pip install -r requirements.txt
+# Tested with:    Python 3.10 / 3.11 / 3.12
+# ============================================================
+
+# --- Core framework ---
+streamlit>=1.35.0
+
+# --- Data validation & modelling ---
+pydantic>=2.7.0
+
+# --- Document extraction ---
+docling>=2.5.0           # primary extractor (PDF, DOCX, HTML)
+python-docx>=1.1.2       # fallback DOCX extraction
+pdfplumber>=0.11.0       # fallback PDF extraction
+pypdf>=4.3.0             # secondary PDF fallback
+
+# --- Fuzzy matching ---
+rapidfuzz>=3.9.0         # fast C-extension Levenshtein / token ratios
+
+# --- Semantic matching ---
+sentence-transformers>=3.0.0  # SentenceTransformer with all-MiniLM-L6-v2
+torch>=2.2.0,<3.0.0           # PyTorch backend for sentence-transformers
+                               # Use torch with CPU-only: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# --- Numeric / vector ops ---
+numpy>=1.26.0
+
+# --- Testing ---
+pytest>=8.2.0
+pytest-cov>=5.0.0
