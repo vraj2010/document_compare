@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from models import ChangeType, ComparisonReport
+from models import ChangeType, ComparisonReport, ChunkMatch
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +36,56 @@ _CHANGE_LABELS = {
     ChangeType.REMOVED:            "Removed",
     ChangeType.UNCHANGED:          "Unchanged",
 }
+
+
+# ---------------------------------------------------------------------------
+# Display-category mapping
+# ---------------------------------------------------------------------------
+
+_DISPLAY_CATEGORY_MAP: dict[str, str] = {
+    # ChangeType.value → display category
+    ChangeType.ADDED.value:              "Added",
+    ChangeType.REMOVED.value:            "Removed",
+    ChangeType.MODIFIED.value:           "Modified",
+    ChangeType.SEMANTIC.value:           "Modified",         # semantic_change → Modified
+    ChangeType.SEMANTIC_DIFFERENT.value: "Modified",         # semantically_different → Modified
+}
+
+# Badge colors per display category
+_CATEGORY_BADGE: dict[str, tuple[str, str, str]] = {
+    # (border_color, badge_bg, badge_label)
+    "Semantically Different": ("#c62828", "#c62828", "SEMANTICALLY DIFFERENT"),
+    "Modified":               ("#e65100", "#e65100", "MODIFIED"),
+    "Added":                  ("#2e7d32", "#2e7d32", "ADDED"),
+    "Removed":                ("#757575", "#757575", "REMOVED"),
+}
+
+# Dropdown options — exact spec
+FILTER_OPTIONS = [
+    "All Differences",
+    "Semantically Different",
+    "Modified",
+    "Added",
+    "Removed",
+]
+
+
+def get_display_category(match: ChunkMatch) -> str | None:
+    """Map a ChunkMatch to one of the 4 display categories, or None if excluded."""
+    return _DISPLAY_CATEGORY_MAP.get(match.change_type.value, None)
+
+
+def classify_all_differences(matches: list[ChunkMatch]) -> list[tuple[ChunkMatch, str]]:
+    """
+    Filter matches to only the 4 displayable categories and return
+    (match, category) pairs.
+    """
+    result: list[tuple[ChunkMatch, str]] = []
+    for m in matches:
+        cat = get_display_category(m)
+        if cat is not None:
+            result.append((m, cat))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +138,7 @@ def render_stats_bar(report: ComparisonReport):
 
 
 # ---------------------------------------------------------------------------
-# Individual match card
+# Individual match card (original expander-style — kept for compatibility)
 # ---------------------------------------------------------------------------
 
 def render_match_card(match, index: int):
@@ -151,7 +201,7 @@ def render_match_card(match, index: int):
 
 
 # ---------------------------------------------------------------------------
-# Meaning difference helpers
+# Meaning difference helpers (original — kept for backward compat)
 # ---------------------------------------------------------------------------
 
 def is_meaning_difference(match) -> bool:
@@ -185,7 +235,45 @@ def _build_reason(match) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Meaning difference card
+# Category-aware reason builder (for all 4 categories)
+# ---------------------------------------------------------------------------
+
+def _build_category_reason(match: ChunkMatch, category: str) -> str:
+    """Build the REASON text per the specification for each category."""
+    if category == "Semantically Different":
+        base = ""
+        if match.semantic_analysis and match.semantic_analysis.summary:
+            base = match.semantic_analysis.summary + " "
+        base += f"Core meaning has changed significantly. Cosine similarity: {match.semantic_score:.2f}"
+        return base
+
+    if category == "Modified":
+        base = ""
+        if match.semantic_analysis and match.semantic_analysis.summary:
+            base = match.semantic_analysis.summary + " "
+        # Append critical info changes
+        if match.critical_info_changes:
+            for c in match.critical_info_changes:
+                if c.revised and c.revised not in ("(removed)", "(changed)"):
+                    base += f"{c.info_type.capitalize()} changed from \"{c.original}\" to \"{c.revised}\". "
+                elif c.revised == "(removed)":
+                    base += f"{c.info_type.capitalize()} \"{c.original}\" was removed. "
+                else:
+                    base += f"{c.info_type.capitalize()} \"{c.original}\" was changed. "
+        base += f"Text has been revised with partial meaning change. Fuzzy score: {match.fuzzy_score:.2f}"
+        return base.strip()
+
+    if category == "Added":
+        return "This section appears only in the updated document."
+
+    if category == "Removed":
+        return "This section was present in the original but removed in the updated document."
+
+    return "Content has changed between documents."
+
+
+# ---------------------------------------------------------------------------
+# Meaning difference card (original — kept for backward compat)
 # ---------------------------------------------------------------------------
 
 def render_meaning_diff_card(match, index: int, file_a_name: str = "", file_b_name: str = ""):
@@ -293,6 +381,118 @@ def render_meaning_diff_card(match, index: int, file_a_name: str = "", file_b_na
       </div>
     </div>
     """, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# NEW: Category-aware difference card (all 4 categories)
+# ---------------------------------------------------------------------------
+
+def render_category_diff_card(
+    match: ChunkMatch,
+    category: str,
+    index: int,
+    file_a_name: str = "",
+    file_b_name: str = "",
+):
+    """
+    Render a difference card with category-specific badge color, text panels,
+    and auto-generated reason.  Uses Streamlit-native columns for layout so
+    that HTML snippets stay small and flush-left (avoiding the Streamlit
+    markdown parser treating indented HTML as code blocks).
+    """
+    border_color, badge_bg, badge_label = _CATEGORY_BADGE.get(
+        category, ("#757575", "#757575", category.upper())
+    )
+
+    reason = _build_category_reason(match, category)
+
+    # --- Determine text for left / right panels --------------------------
+    if category == "Added":
+        text_a_display = '<em style="color:#9e9e9e;">—Not present in original document—</em>'
+        raw_b = match.chunk_b.text if match.chunk_b else ""
+        text_b_display = _html_escape(raw_b) if raw_b else '<em style="color:#9e9e9e;">— empty —</em>'
+    elif category == "Removed":
+        raw_a = match.chunk_a.text if match.chunk_a else ""
+        text_a_display = _html_escape(raw_a) if raw_a else '<em style="color:#9e9e9e;">— empty —</em>'
+        text_b_display = '<em style="color:#9e9e9e;">—Not present in updated document—</em>'
+    else:
+        raw_a = match.chunk_a.text if match.chunk_a else ""
+        raw_b = match.chunk_b.text if match.chunk_b else ""
+        text_a_display = _html_escape(raw_a) if raw_a else '<em style="color:#9e9e9e;">— not present —</em>'
+        text_b_display = _html_escape(raw_b) if raw_b else '<em style="color:#9e9e9e;">— not present —</em>'
+
+    file_a_hint = f" — {_html_escape(file_a_name)}" if file_a_name else ""
+    file_b_hint = f" — {_html_escape(file_b_name)}" if file_b_name else ""
+
+    # --- Badge row -------------------------------------------------------
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">'
+        f'<span style="background:{badge_bg};color:#fff;border-radius:20px;'
+        f'padding:3px 12px;font-size:11px;font-weight:700;letter-spacing:.4px;">'
+        f'{badge_label}</span>'
+        f'<span style="font-size:14px;font-weight:700;color:#424242;">'
+        f'DIFFERENCE #{index}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    # --- Side-by-side text panels using st.columns -----------------------
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown(
+            f'<div style="font-size:12px;font-weight:700;color:{border_color};'
+            f'text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">'
+            f'ORIGINAL TEXT'
+            f'<span style="font-weight:400;color:#757575;font-size:11px;'
+            f'text-transform:none;letter-spacing:0;">{file_a_hint}</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div style="background:#fafafa;border-left:4px solid {border_color};'
+            f'border-radius:4px;padding:12px 16px;font-size:14px;line-height:1.6;'
+            f'color:#424242;white-space:pre-wrap;word-break:break-word;'
+            f'min-height:60px;">{text_a_display}</div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_b:
+        st.markdown(
+            f'<div style="font-size:12px;font-weight:700;color:{border_color};'
+            f'text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">'
+            f'UPDATED TEXT'
+            f'<span style="font-weight:400;color:#757575;font-size:11px;'
+            f'text-transform:none;letter-spacing:0;">{file_b_hint}</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div style="background:#fafafa;border-left:4px solid {border_color};'
+            f'border-radius:4px;padding:12px 16px;font-size:14px;line-height:1.6;'
+            f'color:#424242;white-space:pre-wrap;word-break:break-word;'
+            f'min-height:60px;">{text_b_display}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # --- Reason ----------------------------------------------------------
+    st.markdown(
+        '<div style="font-size:12px;font-weight:700;color:#e65100;'
+        'text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">'
+        'REASON</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div style="background:#fff3e0;border-left:4px solid #e65100;'
+        f'border-radius:4px;padding:12px 16px;font-size:13px;line-height:1.6;'
+        f'color:#5d4037;font-style:italic;">{_html_escape(reason)}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # --- Card separator --------------------------------------------------
+    st.markdown("---")
+
+
+def _html_escape(text: str) -> str:
+    """Minimal HTML escaping for safe rendering."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ---------------------------------------------------------------------------

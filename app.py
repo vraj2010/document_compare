@@ -30,6 +30,9 @@ from ui import (
     render_download_buttons,
     render_meaning_diff_card,
     is_meaning_difference,
+    render_category_diff_card,
+    classify_all_differences,
+    FILTER_OPTIONS,
 )
 from models import ChangeType
 
@@ -167,6 +170,8 @@ if "json_report" not in st.session_state:
     st.session_state.json_report = None
 if "html_report" not in st.session_state:
     st.session_state.html_report = None
+if "diff_filter" not in st.session_state:
+    st.session_state.diff_filter = "All Differences"
 
 
 # ===========================================================================
@@ -340,11 +345,11 @@ with tab_compare:
     if report is None:
         st.info("👆 Upload two documents and click **Compare Documents** to see results here.")
     else:
-        # ---- Filter to meaning differences only -------------------------
-        meaning_diffs = [m for m in report.matches if is_meaning_difference(m)]
-        diff_count = len(meaning_diffs)
+        # ---- Classify all displayable differences -----------------------
+        all_diffs = classify_all_differences(report.matches)
+        diff_count = len(all_diffs)
 
-        # ---- Header banner ----------------------------------------------
+        # ---- Header banner (counts all 4 categories) --------------------
         if diff_count > 0:
             banner_bg = "#c62828"
             banner_icon = "⚠️"
@@ -378,7 +383,22 @@ with tab_compare:
         </div>
         """, unsafe_allow_html=True)
 
-        # ---- Meaning difference cards -----------------------------------
+        # ---- Dropdown filter --------------------------------------------
+        selected_filter = st.selectbox(
+            "Filter by category",
+            options=FILTER_OPTIONS,
+            index=FILTER_OPTIONS.index(st.session_state.diff_filter),
+            key="diff_filter",
+            label_visibility="collapsed",
+        )
+
+        # ---- Apply filter -----------------------------------------------
+        if selected_filter == "All Differences":
+            filtered_diffs = all_diffs
+        else:
+            filtered_diffs = [(m, cat) for m, cat in all_diffs if cat == selected_filter]
+
+        # ---- Render difference cards ------------------------------------
         if diff_count == 0:
             st.markdown("""
             <div style="
@@ -394,13 +414,32 @@ with tab_compare:
               <div>No statements with materially different meaning were found between the two documents.</div>
             </div>
             """, unsafe_allow_html=True)
+        elif len(filtered_diffs) == 0:
+            st.markdown(f"""
+            <div style="
+                text-align: center;
+                padding: 48px 24px;
+                color: #757575;
+                font-size: 16px;
+            ">
+              <div style="font-size: 36px; margin-bottom: 12px;">🔍</div>
+              <div style="font-weight: 600; color: #616161; font-size: 16px; margin-bottom: 8px;">
+                No &ldquo;{selected_filter}&rdquo; differences found
+              </div>
+              <div>Try selecting a different category or &ldquo;All Differences&rdquo;.</div>
+            </div>
+            """, unsafe_allow_html=True)
         else:
-            for i, match in enumerate(meaning_diffs):
-                render_meaning_diff_card(
-                    match, i,
+            for i, (match, category) in enumerate(filtered_diffs):
+                render_category_diff_card(
+                    match=match,
+                    category=category,
+                    index=i + 1,
                     file_a_name=report.doc_a_metadata.filename,
                     file_b_name=report.doc_b_metadata.filename,
                 )
+
+        st.caption(f"Showing {len(filtered_diffs)} of {len(report.matches)} chunks")
 
         # ---- Download reports -------------------------------------------
         if st.session_state.json_report and st.session_state.html_report:
@@ -408,7 +447,7 @@ with tab_compare:
             with st.expander("📥 Download Reports", expanded=False):
                 st.markdown(
                     "**JSON** is machine-readable; **HTML** is a self-contained visual report. "
-                    "Both contain only the meaning differences."
+                    "Both contain all differences across all 4 categories."
                 )
                 st.markdown("")
                 render_download_buttons(

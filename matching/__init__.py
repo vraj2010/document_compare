@@ -95,16 +95,22 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / norm)
 
 
-def _semantic_change_type(score: float, fuzzy: float) -> tuple[SemanticChangeType, str]:
+def generate_reason(score: float, fuzzy: float, is_modified: bool = False, is_cosine_only: bool = False, crit_detail: str = "") -> tuple[SemanticChangeType, str]:
+    if crit_detail:
+        return SemanticChangeType.MODIFIED, f"Critical value change detected. {crit_detail}"
+    if is_modified:
+        if is_cosine_only:
+            return SemanticChangeType.MODIFIED, f"Meaning preserved with different phrasing. Cosine: {score:.2f}"
+        if fuzzy >= 0.92:
+            return SemanticChangeType.MODIFIED, f"Minor wording revision, intent unchanged. Fuzzy: {fuzzy:.2f}"
+        if fuzzy >= 0.80:
+            return SemanticChangeType.MODIFIED, f"Rephrased with same core meaning. Fuzzy: {fuzzy:.2f}"
+        return SemanticChangeType.MODIFIED, f"Substantially reworded, meaning preserved. Fuzzy: {fuzzy:.2f}"
+
     cfg = CONFIG.matching
     if score >= cfg.semantic_similar_threshold:
-        if fuzzy >= 0.85:
-            return SemanticChangeType.PRESERVED, "Wording is very similar; meaning preserved."
-        return SemanticChangeType.PRESERVED, "Different wording, same core meaning."
-    if score >= cfg.semantic_change_low:
-        if fuzzy < 0.5:
-            # Low lexical overlap but moderate semantic overlap → expanded/reduced
-            return SemanticChangeType.EXPANDED, "Meaning appears to have been elaborated or expanded."
+        return SemanticChangeType.PRESERVED, "Meaning preserved with different phrasing."
+    if score >= 0.45:
         return SemanticChangeType.MODIFIED, "Core meaning partially changed or refined."
     if score >= cfg.semantic_contradiction_threshold:
         return SemanticChangeType.REDUCED, "Significant meaning loss or reduction detected."
@@ -212,6 +218,313 @@ def _extract_critical_info_changes(text_a: str, text_b: str) -> list[CriticalInf
 
 
 # ---------------------------------------------------------------------------
+# Critical value change detector (pre-classification override)
+# ---------------------------------------------------------------------------
+
+# Step 1 — Exclusion patterns: strip dates, standard codes, revision numbers,
+# grade codes, times, and URLs before extracting measurement numbers.
+_EXCLUSION_PATTERNS: list[re.Pattern] = [
+    re.compile(r'\b\d{1,2}[-/]\w{3,9}[-/]\d{4}\b'),                       # 15-Jan-2024, 05/Feb/2024
+    re.compile(r'\b\d{4}[-/]\d{2}[-/]\d{2}\b'),                           # 2024-01-15
+    re.compile(
+        r'\b(ISO|ASME|ASTM|API|SAES|NACE|PED|EN|GI|MRQ|ITP|FAT|NDE|RT|BW|RF|FLG)'
+        r'\s*[-/]?\s*[\d]+[\d\.\-/A-Za-z]*',
+        re.IGNORECASE,
+    ),                                                                     # ISO 15848-1, API 6D, PED 2014/68/EU
+    re.compile(r'Rev\.\s*\d+', re.IGNORECASE),                             # Rev. 0, Rev. 1
+    re.compile(r'\bMRQ[-\s]\d+', re.IGNORECASE),                          # MRQ-12345
+    re.compile(r'\b[A-Z]{1,5}\d+[A-Z]?\b'),                               # grade codes: WCB, F6a, B7, F316L
+    re.compile(r'\b\d{1,2}:\d{2}\b'),                                     # 12:00
+    re.compile(r'portal\.\S+'),                                            # URLs
+    re.compile(r'\b\d{4}\b(?=\s*/\s*\d+\s*/)'),                          # years in standard refs like 2014/68/EU
+]
+
+
+def _apply_exclusions(text: str) -> str:
+    """Strip reference / administrative numbers so they are never compared."""
+    cleaned = text
+    for pat in _EXCLUSION_PATTERNS:
+        cleaned = pat.sub('', cleaned)
+    return cleaned
+
+
+# Step 2 — Measurement extraction
+
+MEASUREMENT_UNITS: list[str] = [
+    'psi', 'bar', 'kpa', 'mpa', 'lbf', 'kn',
+    '%', 'percent',
+    '\u00b0f', '\u00b0c', 'degf', 'degc',
+    '"', 'inch', 'inches',
+    'month', 'months', 'year', 'years',
+    'week', 'weeks', 'day', 'days',
+    'mm', 'cm', 'm', 'km',
+    'kg', 'lb', 'ton',
+    'l', 'ml', 'gal',
+]
+
+MEASUREMENT_CONTEXT_KEYWORDS: list[str] = [
+    'pressure', 'temperature', 'rating', 'pull', 'force', 'load',
+    'capacity', 'flow', 'velocity', 'speed', 'torque', 'stress',
+    'warranty', 'valid', 'validity', 'penalty', 'damages', 'bond',
+    'maximum', 'minimum', 'minimum of', 'up to', 'not exceed',
+    'design', 'test', 'operating', 'allowable',
+    'diameter', 'size', 'bore', 'thickness', 'wall',
+]
+
+_RAW_NUM_RE = re.compile(r'\b([\d,]+\.?\d*)\b')
+
+
+def _extract_measurement_numbers(
+    text: str,
+) -> list[tuple[float, str, bool, str]]:
+    """Return ``(value, unit_if_adjacent, is_class, raw_str)`` for numbers that are
+    adjacent to a measurement unit or sit inside a measurement sentence."""
+    results: list[tuple[float, str, bool, str]] = []
+    for m in _RAW_NUM_RE.finditer(text):
+        num_str = m.group(1)
+        try:
+            num_val = float(num_str.replace(',', ''))
+        except ValueError:
+            continue
+        if num_val == 0:
+            continue
+
+        after_text = text[m.end():m.end() + 10]
+        unit_match = re.match(r'[-\s]{0,3}(psi|bar|lbf|%|°[fFcC]|"|mm|kg|days?|weeks?|months?)', after_text, re.IGNORECASE)
+        unit = unit_match.group(1).strip() if unit_match else ""
+
+        before_text = text[max(0, m.start() - 10):m.start()].lower()
+        is_class = "class" in before_text
+
+        # Sentence context: delimit on '.'
+        sent_start = text.rfind('.', 0, m.start())
+        sent_end = text.find('.', m.end())
+        if sent_start == -1:
+            sent_start = 0
+        if sent_end == -1:
+            sent_end = len(text)
+        sentence = text[sent_start:sent_end].lower()
+        has_kw = any(kw in sentence for kw in MEASUREMENT_CONTEXT_KEYWORDS)
+
+        if unit or is_class or has_kw:
+            results.append((num_val, unit, is_class, num_str))
+    return results
+
+
+# Step 3 — Compare measurement numbers
+
+def _compare_measurement_numbers(
+    nums_a: list[tuple[float, str, bool, str]],
+    nums_b: list[tuple[float, str, bool, str]],
+) -> tuple[bool, str]:
+    """Positional comparison: pair by index, flag > 5 % change."""
+    changes = []
+    for i, (val_a, unit_a, is_class_a, raw_a) in enumerate(nums_a):
+        if i >= len(nums_b):
+            break
+        val_b, unit_b, is_class_b, raw_b = nums_b[i]
+        if val_a == 0:
+            continue
+        pct = abs(val_b - val_a) / abs(val_a)
+        if pct > 0.05:
+            if is_class_a or is_class_b:
+                changes.append(f"Pressure class changed: {raw_a} \u2192 {raw_b}")
+            else:
+                unit = unit_b or unit_a
+                suffix = f" {unit}" if unit else ""
+                changes.append(f"{raw_a} \u2192 {raw_b}{suffix}")
+    if changes:
+        seen = set()
+        unique_changes = []
+        for change in changes:
+            if change not in seen:
+                seen.add(change)
+                unique_changes.append(change)
+        
+        remaining = len(changes) - len(unique_changes)
+        detail = "; ".join(unique_changes)
+        if remaining > 0:
+            detail += f" (+ {remaining} similar change(s) across rows)"
+        return True, detail
+    return False, ''
+
+
+# Step 6 — Administrative chunk guard
+
+_ADMIN_SIGNALS: list[str] = [
+    'rev.', 'mrq no', 'no later than', 'submitted by',
+    'portal.aramco', 'bid submission deadline',
+]
+
+
+def is_administrative_chunk(text_a: str, text_b: str) -> bool:
+    """Return True if the chunk pair is administrative (date/revision header,
+    submission deadline, portal URL, etc.) so that the critical-value override
+    should be skipped."""
+    combined = (text_a + ' ' + text_b).lower()
+    return any(sig in combined for sig in _ADMIN_SIGNALS)
+
+
+# Material / alloy constants (unchanged)
+_MATERIAL_KEYWORDS = [
+    'stellite', 'inconel', 'monel', 'duplex', 'hastelloy', 'chrome',
+    'chromium', 'stainless', 'carbon', 'alloy', 'f316', 'f304',
+    'wcb', 'wcc', 'f6a', 'f11', 'f22', 'overlay', 'hardfacing',
+]
+_MATERIAL_SHORT = ['cr', 'ss', 'b7', 'b8']
+_MATERIAL_SPECIAL = ['13%']
+
+_CONNECTOR_RE = re.compile(
+    r'[A-Z]{2,}\s*\d+\s+(or|and)\s+[A-Z]{2,}\s*\d+',
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Main detector function
+# ---------------------------------------------------------------------------
+
+def detect_critical_value_changes(text_a: str, text_b: str) -> dict:
+    """Pre-check for critical value / specification changes that must
+    override fuzzy-similarity based classification.
+
+    Steps:
+      1. Strip exclusion patterns (dates, standard codes, grade codes, …)
+      2. Extract numbers ONLY adjacent to measurement units / context keywords
+      3. Positional comparison — flag > 5 % relative change
+      4. Material / alloy keyword check (unchanged)
+      5. Logical connector or \u2194 and check (unchanged)
+
+    Returns
+    -------
+    dict with keys:
+        has_critical_change : bool
+        change_type         : str
+        detail              : str
+        details             : list[str]
+    """
+    result: dict = {
+        "has_critical_change": False,
+        "change_type": "",
+        "detail": "",
+        "details": [],
+    }
+
+    text_a_lower = text_a.lower()
+    text_b_lower = text_b.lower()
+
+    # ------------------------------------------------------------------
+    # 1-3. MEASUREMENT NUMBER COMPARISON (exclusion-first)
+    # ------------------------------------------------------------------
+    clean_a = _apply_exclusions(text_a)
+    clean_b = _apply_exclusions(text_b)
+
+    rows_a = [r for r in clean_a.split('\n') if r.strip()]
+    rows_b = [r for r in clean_b.split('\n') if r.strip()]
+    
+    row_diff_msg = ""
+    if (len(rows_a) > 1 or len(rows_b) > 1) and len(rows_a) != len(rows_b):
+        min_len = min(len(rows_a), len(rows_b))
+        valid_a = []
+        valid_b = []
+        for i in range(min_len):
+            col_a = re.split(r'\s{2,}|\t|\|', rows_a[i].strip())[0]
+            col_b = re.split(r'\s{2,}|\t|\|', rows_b[i].strip())[0]
+            if col_a != col_b:
+                break
+            valid_a.append(rows_a[i])
+            valid_b.append(rows_b[i])
+        
+        clean_a = '\n'.join(valid_a)
+        clean_b = '\n'.join(valid_b)
+        diff = len(rows_b) - len(rows_a)
+        if diff > 0:
+            row_diff_msg = f"+ {diff} row(s) added"
+        else:
+            row_diff_msg = f"+ {-diff} row(s) removed"
+
+    meas_a = _extract_measurement_numbers(clean_a)
+    meas_b = _extract_measurement_numbers(clean_b)
+
+    changed = False
+    detail = ""
+    if meas_a and meas_b:
+        changed, detail = _compare_measurement_numbers(meas_a, meas_b)
+    
+    if row_diff_msg:
+        changed = True
+        if detail:
+            detail += f"; {row_diff_msg}"
+        else:
+            detail = row_diff_msg
+
+    if changed:
+        result["details"].append(detail)
+        result["has_critical_change"] = True
+        if not result["change_type"]:
+            result["change_type"] = "numeric_value"
+            result["detail"] = detail
+
+    # ------------------------------------------------------------------
+    # 4. MATERIAL / ALLOY KEYWORD CHECK (unchanged)
+    # ------------------------------------------------------------------
+    mats_a: set[str] = set()
+    mats_b: set[str] = set()
+
+    for kw in _MATERIAL_KEYWORDS:
+        if kw in text_a_lower:
+            mats_a.add(kw)
+        if kw in text_b_lower:
+            mats_b.add(kw)
+    for kw in _MATERIAL_SHORT:
+        pat = r'\b' + re.escape(kw) + r'\b'
+        if re.search(pat, text_a_lower):
+            mats_a.add(kw)
+        if re.search(pat, text_b_lower):
+            mats_b.add(kw)
+    for kw in _MATERIAL_SPECIAL:
+        if kw in text_a:
+            mats_a.add(kw)
+        if kw in text_b:
+            mats_b.add(kw)
+
+    added_mats = mats_b - mats_a
+    removed_mats = mats_a - mats_b
+    if added_mats or removed_mats:
+        parts: list[str] = []
+        if removed_mats:
+            parts.append(f"removed: {', '.join(sorted(removed_mats))}")
+        if added_mats:
+            parts.append(f"added: {', '.join(sorted(added_mats))}")
+        detail = f"Material/spec changed \u2014 {'; '.join(parts)}"
+        result["details"].append(detail)
+        result["has_critical_change"] = True
+        if not result["change_type"]:
+            result["change_type"] = "material_spec"
+            result["detail"] = detail
+
+    # ------------------------------------------------------------------
+    # 5. LOGICAL CONNECTOR FLIP  (or \u2194 and)
+    # ------------------------------------------------------------------
+    conns_a = _CONNECTOR_RE.findall(text_a)
+    conns_b = _CONNECTOR_RE.findall(text_b)
+    if conns_a and conns_b:
+        set_a = {c.lower() for c in conns_a}
+        set_b = {c.lower() for c in conns_b}
+        if set_a != set_b:
+            old = '/'.join(sorted(set_a))
+            new = '/'.join(sorted(set_b))
+            detail = f"Logical connector changed: '{old}' \u2192 '{new}'"
+            result["details"].append(detail)
+            result["has_critical_change"] = True
+            if not result["change_type"]:
+                result["change_type"] = "logical_connector"
+                result["detail"] = detail
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Core matching engine
 # ---------------------------------------------------------------------------
 
@@ -307,13 +620,23 @@ class MatchingEngine:
                 continue
 
             if best_score >= self.cfg.fuzzy_exact_threshold:
-                matches.append(ChunkMatch(
-                    chunk_a=chunk_a,
-                    chunk_b=best_b,
-                    change_type=ChangeType.NEAR_EXACT,
-                    similarity_score=best_score,
-                    fuzzy_score=best_score,
-                ))
+                # Pre-check: critical value changes override near-exact
+                # (skip for administrative chunks — dates, revisions, deadlines)
+                if not is_administrative_chunk(chunk_a.text, best_b.text):
+                    crit = detect_critical_value_changes(chunk_a.text, best_b.text)
+                else:
+                    crit = {"has_critical_change": False}
+                if crit["has_critical_change"]:
+                    # Route to semantic batch for proper scoring
+                    _pending_semantic.append((chunk_a, best_b, best_score))
+                else:
+                    matches.append(ChunkMatch(
+                        chunk_a=chunk_a,
+                        chunk_b=best_b,
+                        change_type=ChangeType.NEAR_EXACT,
+                        similarity_score=best_score,
+                        fuzzy_score=best_score,
+                    ))
                 matched_b_ids.add(best_b.chunk_id)
             elif best_score >= self.cfg.fuzzy_change_low:
                 # Claim the pair — will be semantically re-scored below
@@ -334,27 +657,18 @@ class MatchingEngine:
 
                 crit_changes = _extract_critical_info_changes(chunk_a.text, best_b.text)
 
-                if sem_score >= self.cfg.fuzzy_semantic_reclass_threshold:
-                    # High semantic similarity — just a fuzzy / near-exact rewrite
-                    sem_type, summary = _semantic_change_type(sem_score, fuzzy_score)
-                    sem_analysis = SemanticAnalysis(
-                        change_type=sem_type,
-                        confidence=round(sem_score, 3),
-                        summary=summary,
-                    )
-                    matches.append(ChunkMatch(
-                        chunk_a=chunk_a,
-                        chunk_b=best_b,
-                        change_type=ChangeType.SEMANTIC,
-                        similarity_score=sem_score,
-                        fuzzy_score=fuzzy_score,
-                        semantic_score=sem_score,
-                        semantic_analysis=sem_analysis,
-                        critical_info_changes=crit_changes,
-                    ))
-                elif sem_score >= self.cfg.semantic_change_low:
-                    # Moderate semantic similarity — meaning has shifted
-                    sem_type, summary = _semantic_change_type(sem_score, fuzzy_score)
+                # Gate: skip critical override for administrative chunks
+                if not is_administrative_chunk(chunk_a.text, best_b.text):
+                    crit = detect_critical_value_changes(chunk_a.text, best_b.text)
+                else:
+                    crit = {"has_critical_change": False}
+
+                # DECISION TREE — first match wins:
+
+                # 1. Critical value change → SEMANTICALLY_DIFFERENT
+                #    regardless of fuzzy or semantic score.
+                if crit["has_critical_change"]:
+                    sem_type, summary = generate_reason(sem_score, fuzzy_score, crit_detail=crit['detail'])
                     sem_analysis = SemanticAnalysis(
                         change_type=sem_type,
                         confidence=round(sem_score, 3),
@@ -370,8 +684,53 @@ class MatchingEngine:
                         semantic_analysis=sem_analysis,
                         critical_info_changes=crit_changes,
                     ))
+
+                # 2. High semantic + no critical → SEMANTIC (meaning preserved)
+                elif sem_score >= self.cfg.fuzzy_semantic_reclass_threshold:
+                    sem_type, summary = generate_reason(sem_score, fuzzy_score)
+                    sem_analysis = SemanticAnalysis(
+                        change_type=sem_type,
+                        confidence=round(sem_score, 3),
+                        summary=summary,
+                    )
+                    matches.append(ChunkMatch(
+                        chunk_a=chunk_a,
+                        chunk_b=best_b,
+                        change_type=ChangeType.SEMANTIC,
+                        similarity_score=sem_score,
+                        fuzzy_score=fuzzy_score,
+                        semantic_score=sem_score,
+                        semantic_analysis=sem_analysis,
+                        critical_info_changes=crit_changes,
+                    ))
+
+                # 3. Moderate semantic → SEMANTICALLY_DIFFERENT
+                elif sem_score >= self.cfg.semantic_change_low:
+                    sem_type, summary = generate_reason(sem_score, fuzzy_score)
+                    sem_analysis = SemanticAnalysis(
+                        change_type=sem_type,
+                        confidence=round(sem_score, 3),
+                        summary=summary,
+                    )
+                    matches.append(ChunkMatch(
+                        chunk_a=chunk_a,
+                        chunk_b=best_b,
+                        change_type=ChangeType.SEMANTIC_DIFFERENT,
+                        similarity_score=sem_score,
+                        fuzzy_score=fuzzy_score,
+                        semantic_score=sem_score,
+                        semantic_analysis=sem_analysis,
+                        critical_info_changes=crit_changes,
+                    ))
+
+                # 4. Low semantic → MODIFIED
                 else:
-                    # Low semantic similarity — keep as Modified with critical info
+                    sem_type, summary = generate_reason(sem_score, fuzzy_score, is_modified=True, is_cosine_only=False)
+                    sem_analysis = SemanticAnalysis(
+                        change_type=sem_type,
+                        confidence=round(fuzzy_score, 3),
+                        summary=summary,
+                    )
                     matches.append(ChunkMatch(
                         chunk_a=chunk_a,
                         chunk_b=best_b,
@@ -379,7 +738,7 @@ class MatchingEngine:
                         similarity_score=fuzzy_score,
                         fuzzy_score=fuzzy_score,
                         semantic_score=sem_score,
-                        critical_info_changes=crit_changes,
+                        semantic_analysis=sem_analysis,
                     ))
 
         matched_b_texts = {m.chunk_b.text for m in matches if m.chunk_b}
@@ -441,26 +800,55 @@ class MatchingEngine:
             fuzzy_score = fuzz.token_sort_ratio(chunk_a.text, unmatched_b[best_j].text) / 100.0
 
             if best_score >= self.cfg.semantic_similar_threshold:
-                # High semantic similarity → same meaning, different wording (SEMANTIC)
-                sem_type, summary = _semantic_change_type(best_score, fuzzy_score)
-                sem_analysis = SemanticAnalysis(
-                    change_type=sem_type,
-                    confidence=round(best_score, 3),
-                    summary=summary,
+                # High semantic similarity — but still check for critical value changes
+                # (skip for administrative chunks)
+                if not is_administrative_chunk(chunk_a.text, unmatched_b[best_j].text):
+                    crit = detect_critical_value_changes(chunk_a.text, unmatched_b[best_j].text)
+                else:
+                    crit = {"has_critical_change": False}
+                crit_changes = _extract_critical_info_changes(
+                    chunk_a.text, unmatched_b[best_j].text
                 )
-                matches.append(ChunkMatch(
-                    chunk_a=chunk_a,
-                    chunk_b=unmatched_b[best_j],
-                    change_type=ChangeType.SEMANTIC,
-                    similarity_score=best_score,
-                    fuzzy_score=fuzzy_score,
-                    semantic_score=best_score,
-                    semantic_analysis=sem_analysis,
-                ))
+
+                if crit["has_critical_change"]:
+                    # Critical override → SEMANTICALLY_DIFFERENT
+                    sem_type, summary = generate_reason(best_score, fuzzy_score, crit_detail=crit['detail'])
+                    sem_analysis = SemanticAnalysis(
+                        change_type=sem_type,
+                        confidence=round(best_score, 3),
+                        summary=summary,
+                    )
+                    matches.append(ChunkMatch(
+                        chunk_a=chunk_a,
+                        chunk_b=unmatched_b[best_j],
+                        change_type=ChangeType.SEMANTIC_DIFFERENT,
+                        similarity_score=best_score,
+                        fuzzy_score=fuzzy_score,
+                        semantic_score=best_score,
+                        semantic_analysis=sem_analysis,
+                        critical_info_changes=crit_changes,
+                    ))
+                else:
+                    # No critical change → SEMANTIC (meaning preserved)
+                    sem_type, summary = generate_reason(best_score, fuzzy_score)
+                    sem_analysis = SemanticAnalysis(
+                        change_type=sem_type,
+                        confidence=round(best_score, 3),
+                        summary=summary,
+                    )
+                    matches.append(ChunkMatch(
+                        chunk_a=chunk_a,
+                        chunk_b=unmatched_b[best_j],
+                        change_type=ChangeType.SEMANTIC,
+                        similarity_score=best_score,
+                        fuzzy_score=fuzzy_score,
+                        semantic_score=best_score,
+                        semantic_analysis=sem_analysis,
+                    ))
                 matched_b_indices.add(best_j)
-            elif best_score >= self.cfg.semantic_change_low:
-                # Low-to-moderate semantic similarity → semantically DIFFERENT content
-                sem_type, summary = _semantic_change_type(best_score, fuzzy_score)
+            elif best_score >= 0.45:
+                # Moderate semantic similarity → MODIFIED
+                sem_type, summary = generate_reason(best_score, fuzzy_score, is_modified=True, is_cosine_only=True)
                 sem_analysis = SemanticAnalysis(
                     change_type=sem_type,
                     confidence=round(best_score, 3),
@@ -472,7 +860,28 @@ class MatchingEngine:
                 matches.append(ChunkMatch(
                     chunk_a=chunk_a,
                     chunk_b=unmatched_b[best_j],
-                    change_type=ChangeType.SEMANTIC_DIFFERENT,   # <-- new tag
+                    change_type=ChangeType.MODIFIED,
+                    similarity_score=best_score,
+                    fuzzy_score=fuzzy_score,
+                    semantic_score=best_score,
+                    semantic_analysis=sem_analysis,
+                ))
+                matched_b_indices.add(best_j)
+            elif best_score >= self.cfg.semantic_contradiction_threshold:
+                # < 0.45 -> SEMANTICALLY_DIFFERENT
+                sem_type, summary = generate_reason(best_score, fuzzy_score)
+                sem_analysis = SemanticAnalysis(
+                    change_type=sem_type,
+                    confidence=round(best_score, 3),
+                    summary=summary,
+                )
+                crit_changes = _extract_critical_info_changes(
+                    chunk_a.text, unmatched_b[best_j].text
+                )
+                matches.append(ChunkMatch(
+                    chunk_a=chunk_a,
+                    chunk_b=unmatched_b[best_j],
+                    change_type=ChangeType.SEMANTIC_DIFFERENT,
                     similarity_score=best_score,
                     fuzzy_score=fuzzy_score,
                     semantic_score=best_score,

@@ -2,15 +2,16 @@
 reporting/__init__.py
 
 Generates downloadable JSON and HTML reports from a ComparisonReport.
-Reports contain **only meaning differences** — statements where the
-semantic meaning has materially changed between the two documents.
+Reports contain **all 4 difference categories** — Semantically Different,
+Modified, Added, and Removed — with per-card badge colors and reasons.
 
 Design choices
 --------------
 * JSON — filtered subset of Pydantic .model_dump() serialization.
   Machine-readable, suitable for downstream processing or API responses.
 * HTML — self-contained single-file report with inline CSS.
-  No external dependencies, works offline.  Clean table of meaning diffs.
+  No external dependencies, works offline.  Clean table of diffs with
+  category badges.
 """
 
 from __future__ import annotations
@@ -23,7 +24,77 @@ from config import CONFIG
 
 
 # ---------------------------------------------------------------------------
-# Meaning-difference filter (shared)
+# Display-category mapping (mirrors ui/components.py)
+# ---------------------------------------------------------------------------
+
+_DISPLAY_CATEGORY_MAP: dict[str, str] = {
+    ChangeType.ADDED.value:              "Added",
+    ChangeType.REMOVED.value:            "Removed",
+    ChangeType.MODIFIED.value:           "Modified",
+    ChangeType.SEMANTIC.value:           "Modified",
+    ChangeType.SEMANTIC_DIFFERENT.value: "Modified",
+}
+
+_CATEGORY_COLORS: dict[str, tuple[str, str]] = {
+    # (border_color / badge_bg, badge_label)
+    "Semantically Different": ("#c62828", "SEMANTICALLY DIFFERENT"),
+    "Modified":               ("#e65100", "MODIFIED"),
+    "Added":                  ("#2e7d32", "ADDED"),
+    "Removed":                ("#757575", "REMOVED"),
+}
+
+
+def _get_display_category(match: ChunkMatch) -> str | None:
+    return _DISPLAY_CATEGORY_MAP.get(match.change_type.value, None)
+
+
+def _classify_all(matches: list[ChunkMatch]) -> list[tuple[ChunkMatch, str]]:
+    result: list[tuple[ChunkMatch, str]] = []
+    for m in matches:
+        cat = _get_display_category(m)
+        if cat is not None:
+            result.append((m, cat))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Reason builder (matches ui/components.py _build_category_reason)
+# ---------------------------------------------------------------------------
+
+def _build_category_reason(match: ChunkMatch, category: str) -> str:
+    if category == "Semantically Different":
+        base = ""
+        if match.semantic_analysis and match.semantic_analysis.summary:
+            base = match.semantic_analysis.summary + " "
+        base += f"Core meaning has changed significantly. Cosine similarity: {match.semantic_score:.2f}"
+        return base
+
+    if category == "Modified":
+        base = ""
+        if match.semantic_analysis and match.semantic_analysis.summary:
+            base = match.semantic_analysis.summary + " "
+        if match.critical_info_changes:
+            for c in match.critical_info_changes:
+                if c.revised and c.revised not in ("(removed)", "(changed)"):
+                    base += f"{c.info_type.capitalize()} changed from \"{c.original}\" to \"{c.revised}\". "
+                elif c.revised == "(removed)":
+                    base += f"{c.info_type.capitalize()} \"{c.original}\" was removed. "
+                else:
+                    base += f"{c.info_type.capitalize()} \"{c.original}\" was changed. "
+        base += f"Text has been revised with partial meaning change. Fuzzy score: {match.fuzzy_score:.2f}"
+        return base.strip()
+
+    if category == "Added":
+        return "This section appears only in the updated document."
+
+    if category == "Removed":
+        return "This section was present in the original but removed in the updated document."
+
+    return "Content has changed between documents."
+
+
+# ---------------------------------------------------------------------------
+# Legacy helpers (kept for backward compat)
 # ---------------------------------------------------------------------------
 
 def _is_meaning_difference(match: ChunkMatch) -> bool:
@@ -59,23 +130,35 @@ def _build_reason(match: ChunkMatch) -> str:
 # ---------------------------------------------------------------------------
 
 def generate_json_report(report: ComparisonReport) -> str:
-    meaning_diffs = [m for m in report.matches if _is_meaning_difference(m)]
+    all_diffs = _classify_all(report.matches)
 
     output = {
         "doc_a": report.doc_a_metadata.model_dump(),
         "doc_b": report.doc_b_metadata.model_dump(),
         "total_chunks_analysed": len(report.matches),
-        "meaning_differences_count": len(meaning_diffs),
-        "meaning_differences": [],
+        "total_differences": len(all_diffs),
+        "differences": [],
     }
 
-    for m in meaning_diffs:
+    for m, category in all_diffs:
+        text_a = m.chunk_a.text if m.chunk_a else ""
+        text_b = m.chunk_b.text if m.chunk_b else ""
+
+        # For Added chunks, original text is empty
+        if category == "Added":
+            text_a = ""
+        # For Removed chunks, updated text is empty
+        if category == "Removed":
+            text_b = ""
+
         entry = {
-            "original_text": m.chunk_a.text if m.chunk_a else "",
-            "updated_text": m.chunk_b.text if m.chunk_b else "",
-            "reason": _build_reason(m),
+            "category": category,
+            "original_text": text_a,
+            "updated_text": text_b,
+            "reason": _build_category_reason(m, category),
             "change_type": m.change_type.value,
             "similarity_score": m.similarity_score,
+            "fuzzy_score": m.fuzzy_score,
             "semantic_score": m.semantic_score,
         }
         if m.semantic_analysis:
@@ -93,7 +176,7 @@ def generate_json_report(report: ComparisonReport) -> str:
                 }
                 for c in m.critical_info_changes
             ]
-        output["meaning_differences"].append(entry)
+        output["differences"].append(entry)
 
     return json.dumps(output, indent=2, default=str)
 
@@ -120,30 +203,46 @@ def _escape(text: str | None) -> str:
 
 def generate_html_report(report: ComparisonReport) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    meaning_diffs = [m for m in report.matches if _is_meaning_difference(m)]
-    diff_count = len(meaning_diffs)
+    all_diffs = _classify_all(report.matches)
+    diff_count = len(all_diffs)
 
     file_a = report.doc_a_metadata.filename
     file_b = report.doc_b_metadata.filename
 
     # Build cards
     cards_html = ""
-    for idx, m in enumerate(meaning_diffs):
-        text_a = _escape(m.chunk_a.text if m.chunk_a else None)
-        text_b = _escape(m.chunk_b.text if m.chunk_b else None)
-        reason = _escape(_build_reason(m))
+    for idx, (m, category) in enumerate(all_diffs):
+        border_color, badge_label = _CATEGORY_COLORS.get(
+            category, ("#757575", category.upper())
+        )
+
+        # Text panels per category
+        if category == "Added":
+            text_a = "<em style='color:#9e9e9e; font-style:italic;'>—Not present in original document—</em>"
+            text_b = _escape(m.chunk_b.text if m.chunk_b else None)
+        elif category == "Removed":
+            text_a = _escape(m.chunk_a.text if m.chunk_a else None)
+            text_b = "<em style='color:#9e9e9e; font-style:italic;'>—Not present in updated document—</em>"
+        else:
+            text_a = _escape(m.chunk_a.text if m.chunk_a else None)
+            text_b = _escape(m.chunk_b.text if m.chunk_b else None)
+
+        reason = _escape(_build_category_reason(m, category))
 
         cards_html += (
-            '<div class="diff-card">'
-            f'<div class="badge">DIFFERENCE #{idx + 1}</div>'
+            f'<div class="diff-card" style="border-left-color:{border_color};">'
+            f'<div style="display:flex; align-items:center; gap:10px; margin-bottom:16px;">'
+            f'<span class="badge" style="background:{border_color};">{badge_label}</span>'
+            f'<span style="font-size:14px; font-weight:700; color:#424242;">DIFFERENCE #{idx + 1}</span>'
+            f'</div>'
             '<div class="texts-row">'
             '<div class="text-block">'
-            f'<div class="text-label">ORIGINAL TEXT <span class="file-hint">&mdash; {file_a}</span></div>'
-            f'<div class="text-box">{text_a}</div>'
+            f'<div class="text-label" style="color:{border_color};">ORIGINAL TEXT <span class="file-hint">&mdash; {file_a}</span></div>'
+            f'<div class="text-box" style="border-left-color:{border_color};">{text_a}</div>'
             '</div>'
             '<div class="text-block">'
-            f'<div class="text-label">UPDATED TEXT <span class="file-hint">&mdash; {file_b}</span></div>'
-            f'<div class="text-box">{text_b}</div>'
+            f'<div class="text-label" style="color:{border_color};">UPDATED TEXT <span class="file-hint">&mdash; {file_b}</span></div>'
+            f'<div class="text-box" style="border-left-color:{border_color};">{text_b}</div>'
             '</div>'
             '</div>'
             '<div class="reason-section">'
@@ -154,7 +253,7 @@ def generate_html_report(report: ComparisonReport) -> str:
         )
 
     # No-results card
-    if not meaning_diffs:
+    if not all_diffs:
         cards_html = (
             '<div style="text-align:center; padding:60px 24px; color:#757575; font-size:16px;">'
             '<div style="font-size:48px; margin-bottom:12px;">&#127881;</div>'
@@ -171,7 +270,7 @@ def generate_html_report(report: ComparisonReport) -> str:
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Meaning Differences Report</title>
+  <title>Document Differences Report</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: 'Segoe UI', system-ui, sans-serif; background: #f5f5f5; color: #212121; font-size: 14px; }}
@@ -209,8 +308,8 @@ def generate_html_report(report: ComparisonReport) -> str:
         display: inline-block;
         background: #c62828; color: white;
         border-radius: 20px; padding: 3px 12px;
-        font-size: 12px; font-weight: 700;
-        letter-spacing: 0.3px; margin-bottom: 16px;
+        font-size: 11px; font-weight: 700;
+        letter-spacing: 0.4px;
     }}
     .texts-row {{
         display: grid;
@@ -255,7 +354,7 @@ def generate_html_report(report: ComparisonReport) -> str:
 </head>
 <body>
   <header>
-    <h1>&#9888;&#65039; Meaning Differences Report</h1>
+    <h1>&#9888;&#65039; Document Differences Report</h1>
     <p>Generated: {now} &nbsp;|&nbsp; {diff_count} difference{'s' if diff_count != 1 else ''} found</p>
   </header>
 
@@ -276,6 +375,6 @@ def generate_html_report(report: ComparisonReport) -> str:
 
   </div>
 
-  <footer>Meaning Differences Report &mdash; Built with Docling, RapidFuzz &amp; SentenceTransformers</footer>
+  <footer>Document Differences Report &mdash; Built with Docling, RapidFuzz &amp; SentenceTransformers</footer>
 </body>
 </html>"""

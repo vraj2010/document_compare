@@ -73,7 +73,7 @@ def _overall_similarity(matches: list[ChunkMatch]) -> float:
 
 
 def _document_summary(score: float, stats: LevelStats) -> str:
-    total = stats.exact_matches + stats.near_exact + stats.modified + stats.added + stats.removed + stats.semantic_changes
+    total = stats.exact_matches + stats.near_exact + stats.modified + stats.added + stats.removed + stats.semantic_changes + stats.semantic_different
     if total == 0:
         return "Documents appear identical."
     pct = round(score * 100, 1)

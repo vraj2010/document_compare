@@ -6,6 +6,10 @@ from .components import (
     render_download_buttons,
     render_meaning_diff_card,
     is_meaning_difference,
+    render_category_diff_card,
+    classify_all_differences,
+    get_display_category,
+    FILTER_OPTIONS,
 )
 
 __all__ = [
@@ -15,4 +19,8 @@ __all__ = [
     "render_download_buttons",
     "render_meaning_diff_card",
     "is_meaning_difference",
+    "render_category_diff_card",
+    "classify_all_differences",
+    "get_display_category",
+    "FILTER_OPTIONS",
 ]
