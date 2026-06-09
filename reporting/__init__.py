@@ -2,13 +2,15 @@
 reporting/__init__.py
 
 Generates downloadable JSON and HTML reports from a ComparisonReport.
+Reports contain **only meaning differences** — statements where the
+semantic meaning has materially changed between the two documents.
 
 Design choices
 --------------
-* JSON — direct Pydantic .model_dump() serialization.  Machine-readable,
-  suitable for downstream processing or API responses.
+* JSON — filtered subset of Pydantic .model_dump() serialization.
+  Machine-readable, suitable for downstream processing or API responses.
 * HTML — self-contained single-file report with inline CSS.
-  No external dependencies, works offline.  Uses a color-coded diff view.
+  No external dependencies, works offline.  Clean table of meaning diffs.
 """
 
 from __future__ import annotations
@@ -21,232 +23,259 @@ from config import CONFIG
 
 
 # ---------------------------------------------------------------------------
+# Meaning-difference filter (shared)
+# ---------------------------------------------------------------------------
+
+def _is_meaning_difference(match: ChunkMatch) -> bool:
+    """Return True if this match represents a material meaning change."""
+    if match.change_type == ChangeType.SEMANTIC_DIFFERENT:
+        return True
+    if match.change_type == ChangeType.MODIFIED and match.critical_info_changes:
+        return True
+    return False
+
+
+def _build_reason(match: ChunkMatch) -> str:
+    """Build a human-readable reason explaining the meaning change."""
+    parts: list[str] = []
+
+    if match.semantic_analysis and match.semantic_analysis.summary:
+        parts.append(match.semantic_analysis.summary)
+
+    if match.critical_info_changes:
+        for c in match.critical_info_changes:
+            if c.revised and c.revised not in ("(removed)", "(changed)"):
+                parts.append(f"{c.info_type.capitalize()} changed from \"{c.original}\" to \"{c.revised}\".")
+            elif c.revised == "(removed)":
+                parts.append(f"{c.info_type.capitalize()} \"{c.original}\" was removed.")
+            else:
+                parts.append(f"{c.info_type.capitalize()} \"{c.original}\" was changed.")
+
+    return " ".join(parts) if parts else "Content meaning has materially changed between documents."
+
+
+# ---------------------------------------------------------------------------
 # JSON report
 # ---------------------------------------------------------------------------
 
 def generate_json_report(report: ComparisonReport) -> str:
-    data = report.model_dump()
-    return json.dumps(data, indent=2, default=str)
+    meaning_diffs = [m for m in report.matches if _is_meaning_difference(m)]
+
+    output = {
+        "doc_a": report.doc_a_metadata.model_dump(),
+        "doc_b": report.doc_b_metadata.model_dump(),
+        "total_chunks_analysed": len(report.matches),
+        "meaning_differences_count": len(meaning_diffs),
+        "meaning_differences": [],
+    }
+
+    for m in meaning_diffs:
+        entry = {
+            "original_text": m.chunk_a.text if m.chunk_a else "",
+            "updated_text": m.chunk_b.text if m.chunk_b else "",
+            "reason": _build_reason(m),
+            "change_type": m.change_type.value,
+            "similarity_score": m.similarity_score,
+            "semantic_score": m.semantic_score,
+        }
+        if m.semantic_analysis:
+            entry["semantic_analysis"] = {
+                "type": m.semantic_analysis.change_type.value,
+                "confidence": m.semantic_analysis.confidence,
+                "summary": m.semantic_analysis.summary,
+            }
+        if m.critical_info_changes:
+            entry["critical_info_changes"] = [
+                {
+                    "info_type": c.info_type,
+                    "original": c.original,
+                    "revised": c.revised,
+                }
+                for c in m.critical_info_changes
+            ]
+        output["meaning_differences"].append(entry)
+
+    return json.dumps(output, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# HTML helpers
+# ---------------------------------------------------------------------------
+
+_SNIPPET = CONFIG.reporting.snippet_max_chars
+
+
+def _escape(text: str | None) -> str:
+    if not text:
+        return "<em style='color:#9e9e9e;'>— not present —</em>"
+    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if len(safe) > _SNIPPET:
+        return safe[:_SNIPPET] + "…"
+    return safe
 
 
 # ---------------------------------------------------------------------------
 # HTML report
 # ---------------------------------------------------------------------------
 
-_CHANGE_COLORS = {
-    ChangeType.EXACT:              ("#e8f5e9", "#2e7d32"),   # green
-    ChangeType.NEAR_EXACT:         ("#f1f8e9", "#558b2f"),   # light green
-    ChangeType.MODIFIED:           ("#fff8e1", "#f57f17"),   # amber
-    ChangeType.SEMANTIC:           ("#e3f2fd", "#1565c0"),   # blue
-    ChangeType.SEMANTIC_DIFFERENT: ("#fce4ec", "#c62828"),   # deep red — NEW
-    ChangeType.ADDED:              ("#e8f5e9", "#1b5e20"),   # deep green
-    ChangeType.REMOVED:            ("#ffebee", "#b71c1c"),   # red
-    ChangeType.UNCHANGED:          ("#fafafa", "#424242"),
-}
+def generate_html_report(report: ComparisonReport) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    meaning_diffs = [m for m in report.matches if _is_meaning_difference(m)]
+    diff_count = len(meaning_diffs)
 
-_CHANGE_LABELS = {
-    ChangeType.EXACT:              "Exact Match",
-    ChangeType.NEAR_EXACT:         "Near Exact",
-    ChangeType.MODIFIED:           "Modified",
-    ChangeType.SEMANTIC:           "Semantic Change",
-    ChangeType.SEMANTIC_DIFFERENT: "Semantically Different",  # NEW
-    ChangeType.ADDED:              "Added",
-    ChangeType.REMOVED:            "Removed",
-    ChangeType.UNCHANGED:          "Unchanged",
-}
+    file_a = report.doc_a_metadata.filename
+    file_b = report.doc_b_metadata.filename
 
-_SNIPPET = CONFIG.reporting.snippet_max_chars
+    # Build cards
+    cards_html = ""
+    for idx, m in enumerate(meaning_diffs):
+        text_a = _escape(m.chunk_a.text if m.chunk_a else None)
+        text_b = _escape(m.chunk_b.text if m.chunk_b else None)
+        reason = _escape(_build_reason(m))
 
-
-def _truncate(text: str | None) -> str:
-    if not text:
-        return "<em>—</em>"
-    if len(text) <= _SNIPPET:
-        return text.replace("<", "&lt;").replace(">", "&gt;")
-    return text[:_SNIPPET].replace("<", "&lt;").replace(">", "&gt;") + "…"
-
-
-
-_DIFFERENCE_TYPES_REPORT = {
-    ChangeType.ADDED, ChangeType.REMOVED, ChangeType.MODIFIED,
-    ChangeType.NEAR_EXACT, ChangeType.SEMANTIC, ChangeType.SEMANTIC_DIFFERENT,
-}
-
-
-def _match_row(match: ChunkMatch) -> str:
-    """Return HTML table row(s). Exact matches are excluded — only differences shown."""
-    ct = match.change_type
-
-    # Skip exact matches from the report
-    if ct == ChangeType.EXACT:
-        return ""
-
-    bg, fg = _CHANGE_COLORS.get(ct, ("#fff", "#000"))
-    label = _CHANGE_LABELS.get(ct, ct.value)
-
-    text_a = _truncate(match.chunk_a.text if match.chunk_a else None)
-    text_b = _truncate(match.chunk_b.text if match.chunk_b else None)
-    section = match.chunk_a.section_heading if match.chunk_a else (
-        match.chunk_b.section_heading if match.chunk_b else ""
-    )
-
-    extra_html = ""
-
-    if match.semantic_analysis:
-        sa = match.semantic_analysis
-        sem_bg = "#fce4ec" if ct == ChangeType.SEMANTIC_DIFFERENT else "#e3f2fd"
-        sem_border = "#c62828" if ct == ChangeType.SEMANTIC_DIFFERENT else "#1565c0"
-        sem_icon = "&#x26A0;&#xFE0F; Semantically Different" if ct == ChangeType.SEMANTIC_DIFFERENT else "&#x1F4A1; Semantic Analysis"
-        extra_html += (
-            f'<div class="semantic-badge" style="background:{sem_bg};border-left-color:{sem_border};">' +
-            f'<strong>{sem_icon}:</strong> {sa.change_type.value} &mdash; {sa.summary}' +
-            f'<span class="confidence">Confidence: {sa.confidence:.0%}</span></div>'
-        )
-
-    if getattr(match, "critical_info_changes", None):
-        ci_rows = "".join(
-            f'<tr>' +
-            f'<td class="ci-type">{c.info_type.upper()}</td>' +
-            f'<td class="ci-old">{c.original}</td>' +
-            f'<td class="ci-arrow">&rarr;</td>' +
-            f'<td class="ci-new">{c.revised}</td>' +
-            f'</tr>'
-            for c in match.critical_info_changes
-        )
-        extra_html += (
-            '<div class="critical-info-badge">' +
-            '<strong>&#x26A0;&#xFE0F; Critical Info Changes (Dates / Numbers):</strong>' +
-            f'<table class="ci-table">{ci_rows}</table>' +
+        cards_html += (
+            '<div class="diff-card">'
+            f'<div class="badge">DIFFERENCE #{idx + 1}</div>'
+            '<div class="texts-row">'
+            '<div class="text-block">'
+            f'<div class="text-label">ORIGINAL TEXT <span class="file-hint">&mdash; {file_a}</span></div>'
+            f'<div class="text-box">{text_a}</div>'
+            '</div>'
+            '<div class="text-block">'
+            f'<div class="text-label">UPDATED TEXT <span class="file-hint">&mdash; {file_b}</span></div>'
+            f'<div class="text-box">{text_b}</div>'
+            '</div>'
+            '</div>'
+            '<div class="reason-section">'
+            '<div class="reason-label">REASON</div>'
+            f'<div class="reason-box">{reason}</div>'
+            '</div>'
             '</div>'
         )
 
-    sim_pct = f"{match.similarity_score:.0%}"
-    extra_row = (
-        f'<tr style="background:{bg}"><td colspan="5">{extra_html}</td></tr>'
-        if extra_html else ""
-    )
+    # No-results card
+    if not meaning_diffs:
+        cards_html = (
+            '<div style="text-align:center; padding:60px 24px; color:#757575; font-size:16px;">'
+            '<div style="font-size:48px; margin-bottom:12px;">&#127881;</div>'
+            '<div style="font-weight:600; color:#2e7d32; font-size:18px; margin-bottom:8px;">'
+            'Documents are semantically consistent</div>'
+            '<div>No statements with materially different meaning were found.</div>'
+            '</div>'
+        )
 
-    main_row = (
-        f'<tr style="background:{bg}">' +
-        f'<td><span class="badge" style="background:{fg};color:#fff">{label}</span></td>' +
-        f'<td class="section-col">{section or "&mdash;"}</td>' +
-        f'<td class="text-col">{text_a}</td>' +
-        f'<td class="text-col">{text_b}</td>' +
-        f'<td class="score-col">{sim_pct}</td>' +
-        f'</tr>'
-    )
-
-    return main_row + extra_row
-
-def generate_html_report(report: ComparisonReport) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sim_pct = f"{report.overall_similarity:.1%}"
-    ps = report.paragraph_stats
-
-    stats_html = f"""
-    <div class="stats-grid">
-      <div class="stat-card green"><div class="stat-num">{ps.exact_matches + ps.near_exact}</div><div>Exact / Near-Exact</div></div>
-      <div class="stat-card amber"><div class="stat-num">{ps.modified}</div><div>Modified</div></div>
-      <div class="stat-card blue"><div class="stat-num">{ps.semantic_changes}</div><div>Semantic Changes</div></div>
-      <div class="stat-card red"><div class="stat-num">{ps.removed}</div><div>Removed</div></div>
-      <div class="stat-card green2"><div class="stat-num">{ps.added}</div><div>Added</div></div>
-    </div>
-    """
-
-    rows_html = "".join(_match_row(m) for m in report.matches)
+    diff_count_color = '#c62828' if diff_count > 0 else '#2e7d32'
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Document Comparison Report</title>
+  <title>Meaning Differences Report</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: 'Segoe UI', system-ui, sans-serif; background: #f5f5f5; color: #212121; font-size: 14px; }}
-    header {{ background: #1a237e; color: white; padding: 24px 32px; }}
+
+    header {{ background: linear-gradient(135deg, #b71c1c 0%, #c62828 50%, #d32f2f 100%); color: white; padding: 28px 32px; }}
     header h1 {{ font-size: 24px; font-weight: 700; margin-bottom: 4px; }}
-    header p {{ opacity: 0.8; font-size: 13px; }}
-    .container {{ max-width: 1400px; margin: 24px auto; padding: 0 16px; }}
-    .summary-card {{ background: white; border-radius: 12px; padding: 24px; margin-bottom: 20px;
-                    box-shadow: 0 2px 8px rgba(0,0,0,.08); }}
-    .score-ring {{ font-size: 48px; font-weight: 900; color: #1a237e; }}
-    .score-ring small {{ font-size: 18px; color: #757575; }}
-    .summary-text {{ color: #424242; margin-top: 8px; line-height: 1.6; }}
-    .meta-row {{ display: flex; gap: 32px; margin-top: 16px; flex-wrap: wrap; }}
-    .meta-item {{ font-size: 13px; color: #616161; }}
-    .meta-item strong {{ color: #212121; }}
-    .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin: 20px 0; }}
-    .stat-card {{ background: white; border-radius: 10px; padding: 16px; text-align: center;
-                 box-shadow: 0 2px 6px rgba(0,0,0,.07); font-size: 12px; color: #616161; }}
-    .stat-num {{ font-size: 28px; font-weight: 800; margin-bottom: 4px; }}
-    .green .stat-num {{ color: #2e7d32; }}
-    .amber .stat-num {{ color: #e65100; }}
-    .blue .stat-num {{ color: #1565c0; }}
-    .red .stat-num {{ color: #b71c1c; }}
-    .green2 .stat-num {{ color: #1b5e20; }}
-    table {{ width: 100%; border-collapse: collapse; background: white;
-            border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.08); }}
-    th {{ background: #1a237e; color: white; padding: 12px 14px; text-align: left;
-         font-size: 12px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }}
-    td {{ padding: 10px 14px; border-bottom: 1px solid #f0f0f0; vertical-align: top; }}
-    .badge {{ display: inline-block; padding: 3px 10px; border-radius: 99px;
-             font-size: 11px; font-weight: 700; white-space: nowrap; }}
-    .section-col {{ color: #616161; font-style: italic; font-size: 12px; max-width: 160px; }}
-    .text-col {{ max-width: 380px; word-break: break-word; line-height: 1.5; }}
-    .score-col {{ text-align: center; font-weight: 700; white-space: nowrap; }}
-    .semantic-badge {{ background: #e3f2fd; border-left: 3px solid #1565c0;
-                      padding: 8px 12px; margin: 4px 0; border-radius: 4px; font-size: 12px; }}
-    .confidence {{ float: right; color: #757575; }}
-    .critical-info-badge {{ background:#fff3e0; border-left:3px solid #e65100;
-                      padding:8px 12px; margin:4px 0; border-radius:4px; font-size:12px; }}
-    .ci-table {{ margin-top:4px; border-collapse:collapse; }}
-    .ci-type {{ padding:2px 8px; font-weight:700; color:#c62828; font-size:11px; }}
-    .ci-old {{ padding:2px 8px; text-decoration:line-through; color:#b71c1c; }}
-    .ci-arrow {{ padding:2px 4px; color:#616161; }}
-    .ci-new {{ padding:2px 8px; font-weight:700; color:#1b5e20; }}
-    .deepred .stat-num {{ color:#c62828; }}
+    header p {{ opacity: 0.85; font-size: 13px; }}
+
+    .container {{ max-width: 1200px; margin: 24px auto; padding: 0 16px; }}
+
+    .summary-card {{
+        background: white; border-radius: 12px; padding: 24px; margin-bottom: 28px;
+        box-shadow: 0 2px 8px rgba(0,0,0,.08);
+        display: flex; align-items: center; gap: 20px;
+    }}
+    .diff-count {{
+        font-size: 48px; font-weight: 900;
+        color: {diff_count_color};
+        min-width: 80px; text-align: center;
+    }}
+    .diff-count small {{ font-size: 14px; color: #757575; display: block; font-weight: 500; }}
+    .summary-meta {{ color: #616161; font-size: 13px; line-height: 1.7; }}
+    .summary-meta strong {{ color: #212121; }}
+
+    .diff-card {{
+        background: #ffffff;
+        border: 1px solid #e0e0e0;
+        border-left: 5px solid #c62828;
+        border-radius: 0 12px 12px 0;
+        padding: 20px 24px;
+        margin-bottom: 16px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+    }}
+    .badge {{
+        display: inline-block;
+        background: #c62828; color: white;
+        border-radius: 20px; padding: 3px 12px;
+        font-size: 12px; font-weight: 700;
+        letter-spacing: 0.3px; margin-bottom: 16px;
+    }}
+    .texts-row {{
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        margin-bottom: 14px;
+    }}
+    .text-label {{
+        font-size: 12px; font-weight: 700; color: #b71c1c;
+        text-transform: uppercase; letter-spacing: 0.5px;
+        margin-bottom: 6px;
+    }}
+    .file-hint {{
+        font-weight: 400; color: #757575; font-size: 11px;
+        text-transform: none; letter-spacing: 0;
+    }}
+    .text-box {{
+        background: #fafafa;
+        border-left: 4px solid #c62828;
+        border-radius: 4px;
+        padding: 12px 16px;
+        font-size: 14px; line-height: 1.6; color: #424242;
+        white-space: pre-wrap; word-break: break-word;
+        min-height: 60px;
+    }}
+    .reason-label {{
+        font-size: 12px; font-weight: 700; color: #e65100;
+        text-transform: uppercase; letter-spacing: 0.5px;
+        margin-bottom: 6px;
+    }}
+    .reason-box {{
+        background: #fff3e0;
+        border-left: 4px solid #e65100;
+        border-radius: 4px;
+        padding: 12px 16px;
+        font-size: 13px; line-height: 1.6;
+        color: #5d4037; font-style: italic;
+    }}
+    
     footer {{ text-align: center; padding: 32px; color: #9e9e9e; font-size: 12px; }}
   </style>
 </head>
 <body>
   <header>
-    <h1>&#128203; Document Comparison Report</h1>
-    <p>Generated: {now} &nbsp;|&nbsp; Processing time: {report.processing_time_seconds}s</p>
+    <h1>&#9888;&#65039; Meaning Differences Report</h1>
+    <p>Generated: {now} &nbsp;|&nbsp; {diff_count} difference{'s' if diff_count != 1 else ''} found</p>
   </header>
 
   <div class="container">
 
     <div class="summary-card">
-      <div class="score-ring">{sim_pct} <small>similarity</small></div>
-      <p class="summary-text">{report.document_level_summary}</p>
-      <div class="meta-row">
-        <div class="meta-item">&#128196; <strong>File A:</strong> {report.doc_a_metadata.filename}
+      <div class="diff-count">{diff_count}<small>difference{'s' if diff_count != 1 else ''}</small></div>
+      <div class="summary-meta">
+        <div>&#128196; <strong>File A:</strong> {file_a}
           &nbsp;({report.doc_a_metadata.word_count:,} words)</div>
-        <div class="meta-item">&#128196; <strong>File B:</strong> {report.doc_b_metadata.filename}
+        <div>&#128196; <strong>File B:</strong> {file_b}
           &nbsp;({report.doc_b_metadata.word_count:,} words)</div>
+        <div>&#128230; <strong>{len(report.matches)}</strong> total chunks analysed</div>
       </div>
     </div>
 
-    {stats_html}
-
-    <table>
-      <thead>
-        <tr>
-          <th>Change Type</th>
-          <th>Section</th>
-          <th>Document A (Original)</th>
-          <th>Document B (New)</th>
-          <th>Score</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows_html}
-      </tbody>
-    </table>
+    {cards_html}
 
   </div>
 
-  <footer>Document Comparison System &mdash; Built with Docling, RapidFuzz &amp; SentenceTransformers</footer>
+  <footer>Meaning Differences Report &mdash; Built with Docling, RapidFuzz &amp; SentenceTransformers</footer>
 </body>
 </html>"""

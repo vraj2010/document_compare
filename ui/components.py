@@ -151,6 +151,151 @@ def render_match_card(match, index: int):
 
 
 # ---------------------------------------------------------------------------
+# Meaning difference helpers
+# ---------------------------------------------------------------------------
+
+def is_meaning_difference(match) -> bool:
+    """Return True if this match represents a material meaning change."""
+    if match.change_type == ChangeType.SEMANTIC_DIFFERENT:
+        return True
+    if match.change_type == ChangeType.MODIFIED and match.critical_info_changes:
+        return True
+    return False
+
+
+def _build_reason(match) -> str:
+    """Build a human-readable reason explaining the meaning change."""
+    parts: list[str] = []
+
+    # Semantic analysis summary
+    if match.semantic_analysis and match.semantic_analysis.summary:
+        parts.append(match.semantic_analysis.summary)
+
+    # Critical info changes (dates / numbers)
+    if match.critical_info_changes:
+        for c in match.critical_info_changes:
+            if c.revised and c.revised not in ("(removed)", "(changed)"):
+                parts.append(f"{c.info_type.capitalize()} changed from \"{c.original}\" to \"{c.revised}\".")
+            elif c.revised == "(removed)":
+                parts.append(f"{c.info_type.capitalize()} \"{c.original}\" was removed.")
+            else:
+                parts.append(f"{c.info_type.capitalize()} \"{c.original}\" was changed.")
+
+    return " ".join(parts) if parts else "Content meaning has materially changed between documents."
+
+
+# ---------------------------------------------------------------------------
+# Meaning difference card
+# ---------------------------------------------------------------------------
+
+def render_meaning_diff_card(match, index: int, file_a_name: str = "", file_b_name: str = ""):
+    """Render a clean card showing Original Text, Updated Text, and Reason."""
+    text_a = match.chunk_a.text if match.chunk_a else ""
+    text_b = match.chunk_b.text if match.chunk_b else ""
+    reason = _build_reason(match)
+
+    file_a_label = f' <span style="font-weight:400; color:#757575; font-size:11px; text-transform:none; letter-spacing:0;">— {file_a_name}</span>' if file_a_name else ""
+    file_b_label = f' <span style="font-weight:400; color:#757575; font-size:11px; text-transform:none; letter-spacing:0;">— {file_b_name}</span>' if file_b_name else ""
+
+    st.markdown(f"""
+    <div style="
+        background: #ffffff;
+        border: 1px solid #e0e0e0;
+        border-left: 5px solid #c62828;
+        border-radius: 0 12px 12px 0;
+        padding: 20px 24px;
+        margin-bottom: 16px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+    ">
+      <div style="
+          display: flex;
+          align-items: center;
+          margin-bottom: 16px;
+          gap: 8px;
+      ">
+        <span style="
+            background: #c62828;
+            color: white;
+            border-radius: 20px;
+            padding: 3px 12px;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.3px;
+        ">DIFFERENCE #{index + 1}</span>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px;">
+        <div>
+          <div style="
+              font-size: 12px;
+              font-weight: 700;
+              color: #b71c1c;
+              text-transform: uppercase;
+              letter-spacing: 0.5px;
+              margin-bottom: 6px;
+          ">Original Text{file_a_label}</div>
+          <div style="
+              background: #fafafa;
+              border-left: 4px solid #c62828;
+              border-radius: 4px;
+              padding: 12px 16px;
+              font-size: 14px;
+              line-height: 1.6;
+              color: #424242;
+              white-space: pre-wrap;
+              word-break: break-word;
+              min-height: 60px;
+          ">{text_a or '<em style="color:#9e9e9e;">— not present —</em>'}</div>
+        </div>
+        <div>
+          <div style="
+              font-size: 12px;
+              font-weight: 700;
+              color: #b71c1c;
+              text-transform: uppercase;
+              letter-spacing: 0.5px;
+              margin-bottom: 6px;
+          ">Updated Text{file_b_label}</div>
+          <div style="
+              background: #fafafa;
+              border-left: 4px solid #c62828;
+              border-radius: 4px;
+              padding: 12px 16px;
+              font-size: 14px;
+              line-height: 1.6;
+              color: #424242;
+              white-space: pre-wrap;
+              word-break: break-word;
+              min-height: 60px;
+          ">{text_b or '<em style="color:#9e9e9e;">— not present —</em>'}</div>
+        </div>
+      </div>
+
+      <div>
+        <div style="
+            font-size: 12px;
+            font-weight: 700;
+            color: #e65100;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        ">Reason</div>
+        <div style="
+            background: #fff3e0;
+            border-left: 4px solid #e65100;
+            border-radius: 4px;
+            padding: 12px 16px;
+            font-size: 13px;
+            line-height: 1.6;
+            color: #5d4037;
+            font-style: italic;
+        ">{reason}</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
 # Download buttons
 # ---------------------------------------------------------------------------
 
