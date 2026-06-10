@@ -84,10 +84,8 @@ class HybridChunker:
                 return parts if parts else [text]
 
             for p_idx, para in enumerate(section.paragraphs):
-                if len(para) < self.cfg.min_paragraph_chars:
-                    continue  # skip noise
-                if len(para.split()) < 5:
-                    continue  # skip noise
+                if len(para.strip()) == 0:
+                    continue  # skip empty
 
                 sub_parts = _split_long_para(para)
                 for sp_idx, part in enumerate(sub_parts):
@@ -128,5 +126,8 @@ class HybridChunker:
                         text=tbl_text,
                         source="table",
                     ))
+
+        for i, chunk in enumerate(chunks):
+            chunk.index_in_doc = i
 
         return chunks

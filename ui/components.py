@@ -1,7 +1,8 @@
 """
 ui/components.py
 
-Reusable Streamlit UI building blocks.
+Section-based side-by-side comparison UI for Streamlit.
+Groups all differences by document section rather than raw chunks.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ _BADGE_CSS = {
     ChangeType.NEAR_EXACT:         ("🟩", "#558b2f", "#f1f8e9"),
     ChangeType.MODIFIED:           ("🟡", "#f57f17", "#fff8e1"),
     ChangeType.SEMANTIC:           ("🔵", "#1565c0", "#e3f2fd"),
-    ChangeType.SEMANTIC_DIFFERENT: ("🔴", "#c62828", "#fce4ec"),   # NEW — red for semantically different
+    ChangeType.SEMANTIC_DIFFERENT: ("🔴", "#c62828", "#fce4ec"),
     ChangeType.ADDED:              ("➕", "#1b5e20", "#e8f5e9"),
     ChangeType.REMOVED:            ("➖", "#b71c1c", "#ffebee"),
     ChangeType.UNCHANGED:          ("⚪", "#616161", "#f5f5f5"),
@@ -31,7 +32,7 @@ _CHANGE_LABELS = {
     ChangeType.NEAR_EXACT:         "Near Exact",
     ChangeType.MODIFIED:           "Modified",
     ChangeType.SEMANTIC:           "Semantic Change",
-    ChangeType.SEMANTIC_DIFFERENT: "Semantically Different",   # NEW
+    ChangeType.SEMANTIC_DIFFERENT: "Semantically Different",
     ChangeType.ADDED:              "Added",
     ChangeType.REMOVED:            "Removed",
     ChangeType.UNCHANGED:          "Unchanged",
@@ -43,12 +44,11 @@ _CHANGE_LABELS = {
 # ---------------------------------------------------------------------------
 
 _DISPLAY_CATEGORY_MAP: dict[str, str] = {
-    # ChangeType.value → display category
     ChangeType.ADDED.value:              "Added",
     ChangeType.REMOVED.value:            "Removed",
     ChangeType.MODIFIED.value:           "Modified",
-    ChangeType.SEMANTIC.value:           "Modified",         # semantic_change → Modified
-    ChangeType.SEMANTIC_DIFFERENT.value: "Modified",         # semantically_different → Modified
+    ChangeType.SEMANTIC.value:           "Modified",
+    ChangeType.SEMANTIC_DIFFERENT.value: "Modified",
 }
 
 # Badge colors per display category
@@ -60,10 +60,9 @@ _CATEGORY_BADGE: dict[str, tuple[str, str, str]] = {
     "Removed":                ("#757575", "#757575", "REMOVED"),
 }
 
-# Dropdown options — exact spec
+# Dropdown options
 FILTER_OPTIONS = [
     "All Differences",
-    "Semantically Different",
     "Modified",
     "Added",
     "Removed",
@@ -77,15 +76,16 @@ def get_display_category(match: ChunkMatch) -> str | None:
 
 def classify_all_differences(matches: list[ChunkMatch]) -> list[tuple[ChunkMatch, str]]:
     """
-    Filter matches to only the 4 displayable categories and return
+    Filter matches to only the displayable categories and return
     (match, category) pairs.
     """
+    from comparison.display_utils import merge_matches
     result: list[tuple[ChunkMatch, str]] = []
     for m in matches:
         cat = get_display_category(m)
         if cat is not None:
             result.append((m, cat))
-    return result
+    return merge_matches(result)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ def render_stats_bar(report: ComparisonReport):
     metrics = [
         ("✏️ Modified",        ps.modified,             "#e65100"),
         ("💡 Semantic",        ps.semantic_changes,     "#1565c0"),
-        ("🔴 Sem. Different",  ps.semantic_different,   "#c62828"),  # NEW
+        ("🔴 Sem. Different",  ps.semantic_different,   "#c62828"),
         ("➕ Added",           ps.added,                "#1b5e20"),
         ("➖ Removed",         ps.removed,              "#b71c1c"),
         ("🟩 Near-Exact",      ps.near_exact,           "#558b2f"),
@@ -138,70 +138,7 @@ def render_stats_bar(report: ComparisonReport):
 
 
 # ---------------------------------------------------------------------------
-# Individual match card (original expander-style — kept for compatibility)
-# ---------------------------------------------------------------------------
-
-def render_match_card(match, index: int):
-    ct = match.change_type
-    icon, fg, bg = _BADGE_CSS.get(ct, ("⚪", "#616161", "#f5f5f5"))
-    label = _CHANGE_LABELS.get(ct, ct.value)
-    sim_pct = f"{match.similarity_score:.0%}"
-
-    text_a = match.chunk_a.text if match.chunk_a else ""
-    text_b = match.chunk_b.text if match.chunk_b else ""
-    section = (match.chunk_a.section_heading if match.chunk_a and match.chunk_a.section_heading
-               else (match.chunk_b.section_heading if match.chunk_b else ""))
-
-    title = f"{icon} {label} — {sim_pct}"
-    if section:
-        title += f"  |  §{section[:60]}"
-
-    with st.expander(title, expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Document A (Original)**")
-            st.markdown(f"""<div style="background:#fafafa; border-left:4px solid {fg};
-                padding:12px; border-radius:6px; font-size:13px; white-space:pre-wrap;
-                word-break:break-word; min-height:60px;">{text_a or '<em>— not present —</em>'}</div>""",
-                unsafe_allow_html=True)
-        with c2:
-            st.markdown("**Document B (New)**")
-            st.markdown(f"""<div style="background:{bg}; border-left:4px solid {fg};
-                padding:12px; border-radius:6px; font-size:13px; white-space:pre-wrap;
-                word-break:break-word; min-height:60px;">{text_b or '<em>— not present —</em>'}</div>""",
-                unsafe_allow_html=True)
-
-        if match.semantic_analysis:
-            sa = match.semantic_analysis
-            # Choose color: red for semantically different, blue for semantic change
-            sem_bg = "#fce4ec" if ct == ChangeType.SEMANTIC_DIFFERENT else "#e3f2fd"
-            sem_border = "#c62828" if ct == ChangeType.SEMANTIC_DIFFERENT else "#1565c0"
-            sem_label = "⚠️ Semantically Different" if ct == ChangeType.SEMANTIC_DIFFERENT else "💡 Semantic Analysis"
-            st.markdown(f"""
-            <div style="background:{sem_bg}; border-left:3px solid {sem_border};
-                padding:8px 12px; border-radius:4px; margin-top:8px; font-size:12px;">
-              <strong>{sem_label}:</strong> {sa.change_type.value} &nbsp;|&nbsp;
-              {sa.summary} &nbsp;|&nbsp; Confidence: <strong>{sa.confidence:.0%}</strong>
-            </div>""", unsafe_allow_html=True)
-
-        if match.critical_info_changes:
-            rows_html = "".join(
-                f'<tr><td style="padding:3px 8px; font-weight:600; color:#b71c1c;">{c.info_type.upper()}</td>'
-                f'<td style="padding:3px 8px; text-decoration:line-through; color:#b71c1c;">{c.original}</td>'
-                f'<td style="padding:3px 8px;">→</td>'
-                f'<td style="padding:3px 8px; font-weight:700; color:#1b5e20;">{c.revised}</td></tr>'
-                for c in match.critical_info_changes
-            )
-            st.markdown(f"""
-            <div style="background:#fff3e0; border-left:3px solid #e65100;
-                padding:8px 12px; border-radius:4px; margin-top:6px; font-size:12px;">
-              <strong>⚠️ Critical Info Changes (Dates / Numbers):</strong>
-              <table style="margin-top:6px; border-collapse:collapse;">{rows_html}</table>
-            </div>""", unsafe_allow_html=True)
-
-
-# ---------------------------------------------------------------------------
-# Meaning difference helpers (original — kept for backward compat)
+# Meaning difference helpers (backward compat)
 # ---------------------------------------------------------------------------
 
 def is_meaning_difference(match) -> bool:
@@ -213,178 +150,125 @@ def is_meaning_difference(match) -> bool:
     return False
 
 
-def _build_reason(match) -> str:
-    """Build a human-readable reason explaining the meaning change."""
-    parts: list[str] = []
+# ---------------------------------------------------------------------------
+# Section-based diff card (NEW — side-by-side)
+# ---------------------------------------------------------------------------
 
-    # Semantic analysis summary
-    if match.semantic_analysis and match.semantic_analysis.summary:
-        parts.append(match.semantic_analysis.summary)
+def _html_escape(text: str) -> str:
+    """Minimal HTML escaping for safe rendering."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    # Critical info changes (dates / numbers)
-    if match.critical_info_changes:
-        for c in match.critical_info_changes:
-            if c.revised and c.revised not in ("(removed)", "(changed)"):
-                parts.append(f"{c.info_type.capitalize()} changed from \"{c.original}\" to \"{c.revised}\".")
-            elif c.revised == "(removed)":
-                parts.append(f"{c.info_type.capitalize()} \"{c.original}\" was removed.")
-            else:
-                parts.append(f"{c.info_type.capitalize()} \"{c.original}\" was changed.")
 
-    return " ".join(parts) if parts else "Content meaning has materially changed between documents."
+def render_section_diff_card(
+    diff,  # SectionDiff
+    index: int,
+    file_a_name: str = "",
+    file_b_name: str = "",
+):
+    """
+    Render a section-level difference card with side-by-side layout.
+    Shows both original and revised text for MODIFIED sections,
+    or just one side for ADDED/REMOVED.
+    """
+    status = diff.status
+    heading = diff.heading or "(No heading)"
+
+    # Colors per status
+    if status == "MODIFIED":
+        border_color = "#e65100"
+        badge_bg = "#e65100"
+        badge_label = "MODIFIED"
+    elif status == "REMOVED":
+        border_color = "#c62828"
+        badge_bg = "#c62828"
+        badge_label = "REMOVED"
+    elif status == "ADDED":
+        border_color = "#2e7d32"
+        badge_bg = "#2e7d32"
+        badge_label = "ADDED"
+    else:
+        border_color = "#757575"
+        badge_bg = "#757575"
+        badge_label = status.upper()
+
+    file_a_hint = f" — {_html_escape(file_a_name)}" if file_a_name else ""
+    file_b_hint = f" — {_html_escape(file_b_name)}" if file_b_name else ""
+
+    # --- Badge + heading row ---
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">'
+        f'<span style="background:{badge_bg};color:#fff;border-radius:20px;'
+        f'padding:3px 12px;font-size:11px;font-weight:700;letter-spacing:.4px;">'
+        f'{badge_label}</span>'
+        f'<span style="font-size:14px;font-weight:700;color:#424242;">'
+        f'#{index} &nbsp;|&nbsp; {_html_escape(heading)}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    # Always use side-by-side columns
+    col_a, col_b = st.columns(2)
+
+    if status == "MODIFIED":
+        orig_display = diff.highlighted_original if diff.highlighted_original else _html_escape(diff.original_text)
+        rev_display = diff.highlighted_revised if diff.highlighted_revised else _html_escape(diff.revised_text)
+        orig_bg = "#fafafa"
+        rev_bg = "#fafafa"
+    elif status == "REMOVED":
+        orig_display = _html_escape(diff.original_text) if diff.original_text else '<em style="color:#9e9e9e;">— empty —</em>'
+        rev_display = f'<em style="color:#9e9e9e;">— Content is missing from {_html_escape(file_b_name) if file_b_name else "Document B"} —</em>'
+        orig_bg = "#ffebee"
+        rev_bg = "#fafafa"
+    elif status == "ADDED":
+        orig_display = f'<em style="color:#9e9e9e;">— Content is missing from {_html_escape(file_a_name) if file_a_name else "Document A"} —</em>'
+        rev_display = _html_escape(diff.revised_text) if diff.revised_text else '<em style="color:#9e9e9e;">— empty —</em>'
+        orig_bg = "#fafafa"
+        rev_bg = "#e8f5e9"
+    else:
+        orig_display = _html_escape(diff.original_text)
+        rev_display = _html_escape(diff.revised_text)
+        orig_bg = "#fafafa"
+        rev_bg = "#fafafa"
+
+    with col_a:
+        st.markdown(
+            f'<div style="font-size:12px;font-weight:700;color:{border_color};'
+            f'text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">'
+            f'ORIGINAL TEXT'
+            f'<span style="font-weight:400;color:#757575;font-size:11px;'
+            f'text-transform:none;letter-spacing:0;">{file_a_hint}</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div style="background:{orig_bg};border-left:4px solid {border_color};'
+            f'border-radius:4px;padding:12px 16px;font-size:14px;line-height:1.6;'
+            f'color:#424242;white-space:pre-wrap;word-break:break-word;'
+            f'min-height:60px;">{orig_display}</div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_b:
+        st.markdown(
+            f'<div style="font-size:12px;font-weight:700;color:{border_color};'
+            f'text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">'
+            f'UPDATED TEXT'
+            f'<span style="font-weight:400;color:#757575;font-size:11px;'
+            f'text-transform:none;letter-spacing:0;">{file_b_hint}</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div style="background:{rev_bg};border-left:4px solid {border_color};'
+            f'border-radius:4px;padding:12px 16px;font-size:14px;line-height:1.6;'
+            f'color:#424242;white-space:pre-wrap;word-break:break-word;'
+            f'min-height:60px;">{rev_display}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Separator
+    st.markdown("---")
 
 
 # ---------------------------------------------------------------------------
-# Category-aware reason builder (for all 4 categories)
-# ---------------------------------------------------------------------------
-
-def _build_category_reason(match: ChunkMatch, category: str) -> str:
-    """Build the REASON text per the specification for each category."""
-    if category == "Semantically Different":
-        base = ""
-        if match.semantic_analysis and match.semantic_analysis.summary:
-            base = match.semantic_analysis.summary + " "
-        base += f"Core meaning has changed significantly. Cosine similarity: {match.semantic_score:.2f}"
-        return base
-
-    if category == "Modified":
-        base = ""
-        if match.semantic_analysis and match.semantic_analysis.summary:
-            base = match.semantic_analysis.summary + " "
-        # Append critical info changes
-        if match.critical_info_changes:
-            for c in match.critical_info_changes:
-                if c.revised and c.revised not in ("(removed)", "(changed)"):
-                    base += f"{c.info_type.capitalize()} changed from \"{c.original}\" to \"{c.revised}\". "
-                elif c.revised == "(removed)":
-                    base += f"{c.info_type.capitalize()} \"{c.original}\" was removed. "
-                else:
-                    base += f"{c.info_type.capitalize()} \"{c.original}\" was changed. "
-        base += f"Text has been revised with partial meaning change. Fuzzy score: {match.fuzzy_score:.2f}"
-        return base.strip()
-
-    if category == "Added":
-        return "This section appears only in the updated document."
-
-    if category == "Removed":
-        return "This section was present in the original but removed in the updated document."
-
-    return "Content has changed between documents."
-
-
-# ---------------------------------------------------------------------------
-# Meaning difference card (original — kept for backward compat)
-# ---------------------------------------------------------------------------
-
-def render_meaning_diff_card(match, index: int, file_a_name: str = "", file_b_name: str = ""):
-    """Render a clean card showing Original Text, Updated Text, and Reason."""
-    text_a = match.chunk_a.text if match.chunk_a else ""
-    text_b = match.chunk_b.text if match.chunk_b else ""
-    reason = _build_reason(match)
-
-    file_a_label = f' <span style="font-weight:400; color:#757575; font-size:11px; text-transform:none; letter-spacing:0;">— {file_a_name}</span>' if file_a_name else ""
-    file_b_label = f' <span style="font-weight:400; color:#757575; font-size:11px; text-transform:none; letter-spacing:0;">— {file_b_name}</span>' if file_b_name else ""
-
-    st.markdown(f"""
-    <div style="
-        background: #ffffff;
-        border: 1px solid #e0e0e0;
-        border-left: 5px solid #c62828;
-        border-radius: 0 12px 12px 0;
-        padding: 20px 24px;
-        margin-bottom: 16px;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.06);
-    ">
-      <div style="
-          display: flex;
-          align-items: center;
-          margin-bottom: 16px;
-          gap: 8px;
-      ">
-        <span style="
-            background: #c62828;
-            color: white;
-            border-radius: 20px;
-            padding: 3px 12px;
-            font-size: 12px;
-            font-weight: 700;
-            letter-spacing: 0.3px;
-        ">DIFFERENCE #{index + 1}</span>
-      </div>
-
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px;">
-        <div>
-          <div style="
-              font-size: 12px;
-              font-weight: 700;
-              color: #b71c1c;
-              text-transform: uppercase;
-              letter-spacing: 0.5px;
-              margin-bottom: 6px;
-          ">Original Text{file_a_label}</div>
-          <div style="
-              background: #fafafa;
-              border-left: 4px solid #c62828;
-              border-radius: 4px;
-              padding: 12px 16px;
-              font-size: 14px;
-              line-height: 1.6;
-              color: #424242;
-              white-space: pre-wrap;
-              word-break: break-word;
-              min-height: 60px;
-          ">{text_a or '<em style="color:#9e9e9e;">— not present —</em>'}</div>
-        </div>
-        <div>
-          <div style="
-              font-size: 12px;
-              font-weight: 700;
-              color: #b71c1c;
-              text-transform: uppercase;
-              letter-spacing: 0.5px;
-              margin-bottom: 6px;
-          ">Updated Text{file_b_label}</div>
-          <div style="
-              background: #fafafa;
-              border-left: 4px solid #c62828;
-              border-radius: 4px;
-              padding: 12px 16px;
-              font-size: 14px;
-              line-height: 1.6;
-              color: #424242;
-              white-space: pre-wrap;
-              word-break: break-word;
-              min-height: 60px;
-          ">{text_b or '<em style="color:#9e9e9e;">— not present —</em>'}</div>
-        </div>
-      </div>
-
-      <div>
-        <div style="
-            font-size: 12px;
-            font-weight: 700;
-            color: #e65100;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 6px;
-        ">Reason</div>
-        <div style="
-            background: #fff3e0;
-            border-left: 4px solid #e65100;
-            border-radius: 4px;
-            padding: 12px 16px;
-            font-size: 13px;
-            line-height: 1.6;
-            color: #5d4037;
-            font-style: italic;
-        ">{reason}</div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-# ---------------------------------------------------------------------------
-# NEW: Category-aware difference card (all 4 categories)
+# Legacy card (kept for backward compat)
 # ---------------------------------------------------------------------------
 
 def render_category_diff_card(
@@ -394,19 +278,12 @@ def render_category_diff_card(
     file_a_name: str = "",
     file_b_name: str = "",
 ):
-    """
-    Render a difference card with category-specific badge color, text panels,
-    and auto-generated reason.  Uses Streamlit-native columns for layout so
-    that HTML snippets stay small and flush-left (avoiding the Streamlit
-    markdown parser treating indented HTML as code blocks).
-    """
+    """Legacy chunk-level diff card — kept for backward compatibility."""
+    from comparison.display_utils import highlight_diff
     border_color, badge_bg, badge_label = _CATEGORY_BADGE.get(
         category, ("#757575", "#757575", category.upper())
     )
 
-    reason = _build_category_reason(match, category)
-
-    # --- Determine text for left / right panels --------------------------
     if category == "Added":
         text_a_display = '<em style="color:#9e9e9e;">—Not present in original document—</em>'
         raw_b = match.chunk_b.text if match.chunk_b else ""
@@ -418,13 +295,17 @@ def render_category_diff_card(
     else:
         raw_a = match.chunk_a.text if match.chunk_a else ""
         raw_b = match.chunk_b.text if match.chunk_b else ""
-        text_a_display = _html_escape(raw_a) if raw_a else '<em style="color:#9e9e9e;">— not present —</em>'
-        text_b_display = _html_escape(raw_b) if raw_b else '<em style="color:#9e9e9e;">— not present —</em>'
+        html_a = _html_escape(raw_a)
+        html_b = _html_escape(raw_b)
+        if html_a and html_b:
+            text_a_display, text_b_display = highlight_diff(html_a, html_b)
+        else:
+            text_a_display = html_a if html_a else '<em style="color:#9e9e9e;">— not present —</em>'
+            text_b_display = html_b if html_b else '<em style="color:#9e9e9e;">— not present —</em>'
 
     file_a_hint = f" — {_html_escape(file_a_name)}" if file_a_name else ""
     file_b_hint = f" — {_html_escape(file_b_name)}" if file_b_name else ""
 
-    # --- Badge row -------------------------------------------------------
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">'
         f'<span style="background:{badge_bg};color:#fff;border-radius:20px;'
@@ -435,9 +316,7 @@ def render_category_diff_card(
         unsafe_allow_html=True,
     )
 
-    # --- Side-by-side text panels using st.columns -----------------------
     col_a, col_b = st.columns(2)
-
     with col_a:
         st.markdown(
             f'<div style="font-size:12px;font-weight:700;color:{border_color};'
@@ -454,7 +333,6 @@ def render_category_diff_card(
             f'min-height:60px;">{text_a_display}</div>',
             unsafe_allow_html=True,
         )
-
     with col_b:
         st.markdown(
             f'<div style="font-size:12px;font-weight:700;color:{border_color};'
@@ -472,27 +350,51 @@ def render_category_diff_card(
             unsafe_allow_html=True,
         )
 
-    # --- Reason ----------------------------------------------------------
-    st.markdown(
-        '<div style="font-size:12px;font-weight:700;color:#e65100;'
-        'text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">'
-        'REASON</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f'<div style="background:#fff3e0;border-left:4px solid #e65100;'
-        f'border-radius:4px;padding:12px 16px;font-size:13px;line-height:1.6;'
-        f'color:#5d4037;font-style:italic;">{_html_escape(reason)}</div>',
-        unsafe_allow_html=True,
-    )
-
-    # --- Card separator --------------------------------------------------
     st.markdown("---")
 
 
-def _html_escape(text: str) -> str:
-    """Minimal HTML escaping for safe rendering."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def render_meaning_diff_card(match, index: int, file_a_name: str = "", file_b_name: str = ""):
+    """Render a clean card showing Original Text, Updated Text."""
+    text_a = match.chunk_a.text if match.chunk_a else ""
+    text_b = match.chunk_b.text if match.chunk_b else ""
+
+    file_a_label = f' <span style="font-weight:400; color:#757575; font-size:11px; text-transform:none; letter-spacing:0;">— {file_a_name}</span>' if file_a_name else ""
+    file_b_label = f' <span style="font-weight:400; color:#757575; font-size:11px; text-transform:none; letter-spacing:0;">— {file_b_name}</span>' if file_b_name else ""
+
+    st.markdown(f"""
+    <div style="
+        background: #ffffff;
+        border: 1px solid #e0e0e0;
+        border-left: 5px solid #c62828;
+        border-radius: 0 12px 12px 0;
+        padding: 20px 24px;
+        margin-bottom: 16px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+    ">
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px;">
+        <div>
+          <div style="font-size: 12px; font-weight: 700; color: #b71c1c;
+              text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;">
+            Original Text{file_a_label}</div>
+          <div style="background: #fafafa; border-left: 4px solid #c62828;
+              border-radius: 4px; padding: 12px 16px; font-size: 14px;
+              line-height: 1.6; color: #424242; white-space: pre-wrap;
+              word-break: break-word; min-height: 60px;">
+            {text_a or '<em style="color:#9e9e9e;">— not present —</em>'}</div>
+        </div>
+        <div>
+          <div style="font-size: 12px; font-weight: 700; color: #b71c1c;
+              text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;">
+            Updated Text{file_b_label}</div>
+          <div style="background: #fafafa; border-left: 4px solid #c62828;
+              border-radius: 4px; padding: 12px 16px; font-size: 14px;
+              line-height: 1.6; color: #424242; white-space: pre-wrap;
+              word-break: break-word; min-height: 60px;">
+            {text_b or '<em style="color:#9e9e9e;">— not present —</em>'}</div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------

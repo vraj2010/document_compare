@@ -21,6 +21,7 @@ from datetime import datetime
 
 from models import ChangeType, ChunkMatch, ComparisonReport
 from config import CONFIG
+from comparison.display_utils import merge_matches, highlight_diff
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,7 @@ def _build_reason(match: ChunkMatch) -> str:
 
 def generate_json_report(report: ComparisonReport) -> str:
     all_diffs = _classify_all(report.matches)
+    all_diffs = merge_matches(all_diffs)
 
     output = {
         "doc_a": report.doc_a_metadata.model_dump(),
@@ -155,7 +157,6 @@ def generate_json_report(report: ComparisonReport) -> str:
             "category": category,
             "original_text": text_a,
             "updated_text": text_b,
-            "reason": _build_category_reason(m, category),
             "change_type": m.change_type.value,
             "similarity_score": m.similarity_score,
             "fuzzy_score": m.fuzzy_score,
@@ -204,6 +205,7 @@ def _escape(text: str | None) -> str:
 def generate_html_report(report: ComparisonReport) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     all_diffs = _classify_all(report.matches)
+    all_diffs = merge_matches(all_diffs)
     diff_count = len(all_diffs)
 
     file_a = report.doc_a_metadata.filename
@@ -224,10 +226,11 @@ def generate_html_report(report: ComparisonReport) -> str:
             text_a = _escape(m.chunk_a.text if m.chunk_a else None)
             text_b = "<em style='color:#9e9e9e; font-style:italic;'>—Not present in updated document—</em>"
         else:
-            text_a = _escape(m.chunk_a.text if m.chunk_a else None)
-            text_b = _escape(m.chunk_b.text if m.chunk_b else None)
-
-        reason = _escape(_build_category_reason(m, category))
+            raw_a = m.chunk_a.text if m.chunk_a else ""
+            raw_b = m.chunk_b.text if m.chunk_b else ""
+            html_a = _escape(raw_a)
+            html_b = _escape(raw_b)
+            text_a, text_b = highlight_diff(html_a, html_b)
 
         cards_html += (
             f'<div class="diff-card" style="border-left-color:{border_color};">'
@@ -244,10 +247,6 @@ def generate_html_report(report: ComparisonReport) -> str:
             f'<div class="text-label" style="color:{border_color};">UPDATED TEXT <span class="file-hint">&mdash; {file_b}</span></div>'
             f'<div class="text-box" style="border-left-color:{border_color};">{text_b}</div>'
             '</div>'
-            '</div>'
-            '<div class="reason-section">'
-            '<div class="reason-label">REASON</div>'
-            f'<div class="reason-box">{reason}</div>'
             '</div>'
             '</div>'
         )
@@ -334,19 +333,6 @@ def generate_html_report(report: ComparisonReport) -> str:
         font-size: 14px; line-height: 1.6; color: #424242;
         white-space: pre-wrap; word-break: break-word;
         min-height: 60px;
-    }}
-    .reason-label {{
-        font-size: 12px; font-weight: 700; color: #e65100;
-        text-transform: uppercase; letter-spacing: 0.5px;
-        margin-bottom: 6px;
-    }}
-    .reason-box {{
-        background: #fff3e0;
-        border-left: 4px solid #e65100;
-        border-radius: 4px;
-        padding: 12px 16px;
-        font-size: 13px; line-height: 1.6;
-        color: #5d4037; font-style: italic;
     }}
     
     footer {{ text-align: center; padding: 32px; color: #9e9e9e; font-size: 12px; }}

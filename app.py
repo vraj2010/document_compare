@@ -1,12 +1,13 @@
 """
 app.py — Main Streamlit entry point.
+# Cache invalidated again
 
 Run with:
     streamlit run app.py
 
 Pages (implemented as tabs):
   1. Upload    — drag-and-drop or browse for File A & File B
-  2. Comparison — visual diff with statistics
+  2. Comparison — section-based side-by-side diff with 4 categories
   3. Reports    — download JSON / HTML
 """
 
@@ -26,12 +27,10 @@ import streamlit as st
 from comparison import ComparisonEngine
 from extraction import DocumentExtractor
 from reporting import generate_html_report, generate_json_report
+from comparison.section_grouper import build_section_diffs
 from ui import (
     render_download_buttons,
-    render_meaning_diff_card,
-    is_meaning_difference,
-    render_category_diff_card,
-    classify_all_differences,
+    render_section_diff_card,
     FILTER_OPTIONS,
 )
 from models import ChangeType
@@ -148,8 +147,8 @@ st.markdown("""
 st.markdown("""
 <div class="main-header">
   <h1>📋 DocCompare</h1>
-  <p>Meaning Difference Analysis &mdash;
-     Detect material meaning changes between documents &mdash;
+  <p>Section-Based Document Comparison &mdash;
+     Side-by-side diff with full section context &mdash;
      PDF &bull; DOCX &bull; TXT</p>
 </div>
 """, unsafe_allow_html=True)
@@ -158,7 +157,7 @@ st.markdown("""
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_upload, tab_compare = st.tabs(["📤 Upload", "⚠️ Meaning Differences"])
+tab_upload, tab_compare = st.tabs(["📤 Upload", "⚠️ Differences"])
 
 # ---------------------------------------------------------------------------
 # Session state
@@ -166,10 +165,16 @@ tab_upload, tab_compare = st.tabs(["📤 Upload", "⚠️ Meaning Differences"])
 
 if "report" not in st.session_state:
     st.session_state.report = None
+if "doc_a" not in st.session_state:
+    st.session_state.doc_a = None
+if "doc_b" not in st.session_state:
+    st.session_state.doc_b = None
 if "json_report" not in st.session_state:
     st.session_state.json_report = None
 if "html_report" not in st.session_state:
     st.session_state.html_report = None
+if "section_diffs" not in st.session_state:
+    st.session_state.section_diffs = None
 if "diff_filter" not in st.session_state:
     st.session_state.diff_filter = "All Differences"
 
@@ -247,7 +252,6 @@ with tab_upload:
         # Apply custom config overrides
         from config import CONFIG
         import config as _cfg_module
-        # Re-create config with overrides (frozen dataclass → rebuild)
         from config import MatchingConfig, ChunkingConfig
         new_matching = MatchingConfig(
             fuzzy_exact_threshold=fuzzy_threshold,
@@ -289,16 +293,17 @@ with tab_upload:
             matches = engine.match(chunks_a, chunks_b)
 
             progress.progress(85, text="📊 Building report…")
-            from comparison import ComparisonEngine, _build_level_stats, _overall_similarity, _document_summary
+            from comparison import _build_level_stats, _overall_similarity, _document_summary
+
             stats = _build_level_stats(matches)
             similarity = _overall_similarity(matches)
             summary = _document_summary(similarity, stats)
 
-            from models import ComparisonReport, Chunk, ChangeType
+            from models import ComparisonReport, Chunk
             added = [m.chunk_b for m in matches if m.change_type == ChangeType.ADDED and m.chunk_b]
             removed = [m.chunk_a for m in matches if m.change_type == ChangeType.REMOVED]
             modified = [m for m in matches if m.change_type in (ChangeType.MODIFIED, ChangeType.NEAR_EXACT)]
-            semantic = [m for m in matches if m.change_type == ChangeType.SEMANTIC]
+            semantic = [m for m in matches if m.change_type in (ChangeType.SEMANTIC, ChangeType.SEMANTIC_DIFFERENT)]
 
             report = ComparisonReport(
                 doc_a_metadata=doc_a.metadata,
@@ -312,7 +317,14 @@ with tab_upload:
                 modified_chunks=modified,
                 semantic_chunks=semantic,
             )
+
+            # Build section-level diffs
+            section_diffs = build_section_diffs(norm_a, norm_b, matches)
+
             st.session_state.report = report
+            st.session_state.doc_a = norm_a
+            st.session_state.doc_b = norm_b
+            st.session_state.section_diffs = section_diffs
             st.session_state.json_report = generate_json_report(report)
             st.session_state.html_report = generate_html_report(report)
 
@@ -320,13 +332,12 @@ with tab_upload:
             time.sleep(0.4)
             progress.empty()
 
-            meaning_diffs = [m for m in matches if is_meaning_difference(m)]
-            diff_count = len(meaning_diffs)
+            diff_count = len(section_diffs)
             st.success(
                 f"✅ Comparison complete!  "
-                f"**{diff_count}** meaning difference{'s' if diff_count != 1 else ''} found "
+                f"**{diff_count}** section difference{'s' if diff_count != 1 else ''} found "
                 f"across {len(matches)} chunks analysed. &nbsp;·&nbsp; "
-                f"Switch to the **Meaning Differences** tab to view results."
+                f"Switch to the **Differences** tab to view results."
             )
 
         except Exception as exc:
@@ -336,28 +347,27 @@ with tab_upload:
 
 
 # ===========================================================================
-# TAB 2 — Meaning Differences
+# TAB 2 — Section-Based Differences
 # ===========================================================================
 
 with tab_compare:
     report = st.session_state.report
+    section_diffs = st.session_state.section_diffs
 
-    if report is None:
+    if report is None or section_diffs is None:
         st.info("👆 Upload two documents and click **Compare Documents** to see results here.")
     else:
-        # ---- Classify all displayable differences -----------------------
-        all_diffs = classify_all_differences(report.matches)
-        diff_count = len(all_diffs)
+        diff_count = len(section_diffs)
 
-        # ---- Header banner (counts all 4 categories) --------------------
+        # ---- Header banner ------------------------------------------------
         if diff_count > 0:
             banner_bg = "#c62828"
             banner_icon = "⚠️"
-            banner_text = f"{diff_count} Meaning Difference{'s' if diff_count != 1 else ''} Detected"
+            banner_text = f"{diff_count} Section Difference{'s' if diff_count != 1 else ''} Detected"
         else:
             banner_bg = "#2e7d32"
             banner_icon = "✅"
-            banner_text = "No Meaning Differences Detected"
+            banner_text = "No Differences Detected"
 
         st.markdown(f"""
         <div style="
@@ -383,22 +393,43 @@ with tab_compare:
         </div>
         """, unsafe_allow_html=True)
 
-        # ---- Dropdown filter --------------------------------------------
+        # ---- Filter dropdown -----------------------------------------------
+        filter_options = ["All Differences", "Modified", "Removed", "Added"]
         selected_filter = st.selectbox(
             "Filter by category",
-            options=FILTER_OPTIONS,
-            index=FILTER_OPTIONS.index(st.session_state.diff_filter),
-            key="diff_filter",
+            options=filter_options,
+            index=0,
+            key="diff_filter_select",
             label_visibility="collapsed",
         )
 
-        # ---- Apply filter -----------------------------------------------
+        # ---- Apply filter ---------------------------------------------------
         if selected_filter == "All Differences":
-            filtered_diffs = all_diffs
+            filtered = section_diffs
         else:
-            filtered_diffs = [(m, cat) for m, cat in all_diffs if cat == selected_filter]
+            filtered = [d for d in section_diffs if d.status == selected_filter.upper()]
 
-        # ---- Render difference cards ------------------------------------
+        # ---- Count by category ----------------------------------------------
+        modified_diffs = [d for d in section_diffs if d.status == "MODIFIED"]
+        removed_diffs = [d for d in section_diffs if d.status == "REMOVED"]
+        added_diffs = [d for d in section_diffs if d.status == "ADDED"]
+
+        # ---- Summary stats chips -------------------------------------------
+        st.markdown(f"""
+        <div style="display:flex; gap:12px; margin-bottom:20px; flex-wrap:wrap;">
+          <span style="background:#fff3e0; color:#e65100; border-radius:20px; padding:6px 16px;
+                font-size:13px; font-weight:600;">
+            ✏️ {len(modified_diffs)} Modified</span>
+          <span style="background:#ffebee; color:#c62828; border-radius:20px; padding:6px 16px;
+                font-size:13px; font-weight:600;">
+            ➖ {len(removed_diffs)} Removed</span>
+          <span style="background:#e8f5e9; color:#2e7d32; border-radius:20px; padding:6px 16px;
+                font-size:13px; font-weight:600;">
+            ➕ {len(added_diffs)} Added</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ---- Render section diff cards --------------------------------------
         if diff_count == 0:
             st.markdown("""
             <div style="
@@ -414,7 +445,7 @@ with tab_compare:
               <div>No statements with materially different meaning were found between the two documents.</div>
             </div>
             """, unsafe_allow_html=True)
-        elif len(filtered_diffs) == 0:
+        elif len(filtered) == 0:
             st.markdown(f"""
             <div style="
                 text-align: center;
@@ -430,26 +461,94 @@ with tab_compare:
             </div>
             """, unsafe_allow_html=True)
         else:
-            for i, (match, category) in enumerate(filtered_diffs):
-                render_category_diff_card(
-                    match=match,
-                    category=category,
-                    index=i + 1,
-                    file_a_name=report.doc_a_metadata.filename,
-                    file_b_name=report.doc_b_metadata.filename,
-                )
+            # --- SECTION 1: Modified ---
+            mod_in_filter = [d for d in filtered if d.status == "MODIFIED"]
+            if mod_in_filter:
+                st.markdown("""
+                <div style="font-size:18px; font-weight:800; color:#e65100; margin:20px 0 12px;
+                     padding-bottom:6px; border-bottom:2px solid #fff3e0;">
+                  SECTION 1 — MODIFIED SECTIONS
+                </div>
+                """, unsafe_allow_html=True)
+                for i, d in enumerate(mod_in_filter, 1):
+                    render_section_diff_card(
+                        diff=d,
+                        index=i,
+                        file_a_name=report.doc_a_metadata.filename,
+                        file_b_name=report.doc_b_metadata.filename,
+                    )
 
-        st.caption(f"Showing {len(filtered_diffs)} of {len(report.matches)} chunks")
+            # --- SECTION 2: Removed ---
+            rem_in_filter = [d for d in filtered if d.status == "REMOVED"]
+            if rem_in_filter:
+                st.markdown("""
+                <div style="font-size:18px; font-weight:800; color:#c62828; margin:20px 0 12px;
+                     padding-bottom:6px; border-bottom:2px solid #ffebee;">
+                  SECTION 2 — REMOVED SECTIONS
+                </div>
+                """, unsafe_allow_html=True)
+                for i, d in enumerate(rem_in_filter, 1):
+                    render_section_diff_card(
+                        diff=d,
+                        index=i,
+                        file_a_name=report.doc_a_metadata.filename,
+                        file_b_name=report.doc_b_metadata.filename,
+                    )
 
-        # ---- Download reports -------------------------------------------
+            # --- SECTION 3: Added ---
+            add_in_filter = [d for d in filtered if d.status == "ADDED"]
+            if add_in_filter:
+                st.markdown("""
+                <div style="font-size:18px; font-weight:800; color:#2e7d32; margin:20px 0 12px;
+                     padding-bottom:6px; border-bottom:2px solid #e8f5e9;">
+                  SECTION 3 — ADDED SECTIONS
+                </div>
+                """, unsafe_allow_html=True)
+                for i, d in enumerate(add_in_filter, 1):
+                    render_section_diff_card(
+                        diff=d,
+                        index=i,
+                        file_a_name=report.doc_a_metadata.filename,
+                        file_b_name=report.doc_b_metadata.filename,
+                    )
+
+        # --- SECTION 4: Missing Pages ---
+        has_missing_a = bool(report.doc_a_metadata.missing_pages)
+        has_missing_b = bool(report.doc_b_metadata.missing_pages)
+        if has_missing_a or has_missing_b:
+            st.markdown("""
+            <div style="font-size:18px; font-weight:800; color:#1565c0; margin:20px 0 12px;
+                 padding-bottom:6px; border-bottom:2px solid #e3f2fd;">
+              SECTION 4 — MISSING PAGES
+            </div>
+            """, unsafe_allow_html=True)
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"**{report.doc_a_metadata.filename}**")
+                if has_missing_a:
+                    pages = ", ".join(map(str, sorted(report.doc_a_metadata.missing_pages)))
+                    st.error(f"Missing Pages: {pages}")
+                else:
+                    st.success("No missing pages detected.")
+            with c2:
+                st.markdown(f"**{report.doc_b_metadata.filename}**")
+                if has_missing_b:
+                    pages = ", ".join(map(str, sorted(report.doc_b_metadata.missing_pages)))
+                    st.error(f"Missing Pages: {pages}")
+                else:
+                    st.success("No missing pages detected.")
+
+        st.caption(f"Showing {len(filtered)} of {diff_count} section differences")
+
+        # ---- Download reports -----------------------------------------------
         if st.session_state.json_report and st.session_state.html_report:
             st.markdown("---")
             with st.expander("📥 Download Reports", expanded=False):
                 st.markdown(
                     "**JSON** is machine-readable; **HTML** is a self-contained visual report. "
-                    "Both contain all differences across all 4 categories."
+                    "Both contain all differences across all categories."
                 )
-                st.markdown("")
                 render_download_buttons(
                     st.session_state.json_report,
                     st.session_state.html_report,

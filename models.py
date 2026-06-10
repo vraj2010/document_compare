@@ -45,6 +45,8 @@ class Table(BaseModel):
 class DocumentSection(BaseModel):
     heading: str = ""
     heading_level: int = 0          # 0 = no heading, 1 = H1, 2 = H2, …
+    page_start: int = 0
+    page_end: int = 0
     paragraphs: list[str] = Field(default_factory=list)
     lists: list[list[str]] = Field(default_factory=list)   # each inner list = one bullet list
     tables: list[Table] = Field(default_factory=list)
@@ -65,6 +67,7 @@ class DocumentMetadata(BaseModel):
     filename: str = ""
     file_type: str = ""             # "pdf" | "docx" | "txt"
     page_count: int = 0
+    missing_pages: list[int] = Field(default_factory=list)
     word_count: int = 0
     char_count: int = 0
 
@@ -88,6 +91,7 @@ class Chunk(BaseModel):
     section_heading: str = ""
     text: str
     source: str = ""                # "paragraph" | "table" | "list" | "heading"
+    index_in_doc: int = -1          # global order in the original document
 
 
 # ---------------------------------------------------------------------------

@@ -185,8 +185,19 @@ def _docling_to_document(docling_doc, filename: str, file_type: str) -> Document
         md = docling_doc.export_to_markdown()
         return _extract_txt(md.encode(), filename)
 
+    # Missing pages detection
+    all_pages = []
+    if hasattr(docling_doc, "pages") and isinstance(docling_doc.pages, dict):
+        all_pages = sorted(list(docling_doc.pages.keys()))
+    
+    missing_pages = []
+    if all_pages:
+        min_p, max_p = min(all_pages), max(all_pages)
+        missing_pages = [p for p in range(min_p, max_p + 1) if p not in all_pages]
+
     doc = Document(sections=sections)
     doc.metadata = _build_metadata(filename, file_type, doc)
+    doc.metadata.missing_pages = missing_pages
     return doc
 
 
