@@ -537,223 +537,6 @@ class MatchingEngine:
         self.cfg = CONFIG.matching
         self.embed_cfg = CONFIG.embedding
 
-    # ------------------------------------------------------------------
-    # Stage 1: hash matching
-    # ------------------------------------------------------------------
-
-    def _hash_match(
-        self,
-        chunks_a: list[Chunk],
-        chunks_b: list[Chunk],
-    ) -> tuple[list[ChunkMatch], list[Chunk], list[Chunk]]:
-        """Return exact matches + remaining unmatched chunks."""
-        hash_b: dict[str, Chunk] = {_cached_hash(c.text): c for c in chunks_b}
-        matched_b_keys: set[str] = set()
-        matches: list[ChunkMatch] = []
-        unmatched_a: list[Chunk] = []
-
-        for chunk in chunks_a:
-            h = _cached_hash(chunk.text)
-            if h in hash_b and h not in matched_b_keys:
-                matched_b_keys.add(h)
-                matches.append(ChunkMatch(
-                    chunk_a=chunk,
-                    chunk_b=hash_b[h],
-                    change_type=ChangeType.EXACT,
-                    similarity_score=1.0,
-                    fuzzy_score=1.0,
-                    semantic_score=1.0,
-                ))
-            else:
-                unmatched_a.append(chunk)
-
-        matched_b_texts = {c.text for m in matches for c in [m.chunk_b] if c}
-        unmatched_b = [c for c in chunks_b if c.text not in matched_b_texts]
-
-        logger.debug(
-            "Hash: %d exact, %d unmatched_a, %d unmatched_b",
-            len(matches), len(unmatched_a), len(unmatched_b)
-        )
-        return matches, unmatched_a, unmatched_b
-
-    # ------------------------------------------------------------------
-    # Stage 2: fuzzy matching
-    # ------------------------------------------------------------------
-
-    def _fuzzy_match(
-        self,
-        unmatched_a: list[Chunk],
-        unmatched_b: list[Chunk],
-    ) -> tuple[list[ChunkMatch], list[Chunk], list[Chunk]]:
-        """Greedy best-fuzzy-match; O(|a|×|b|) but all in native C.
-
-        After claiming a fuzzy match we run semantic scoring on it.
-        If the semantic score shows meaning has changed (below the
-        semantic_similar_threshold), the match is reclassified to
-        SEMANTIC or SEMANTIC_DIFFERENT with full analysis — so it
-        appears in semantic filters instead of being buried as "Modified".
-        """
-        if not unmatched_a or not unmatched_b:
-            return [], unmatched_a, unmatched_b
-
-        matched_b_ids: set[str] = set()
-        matches: list[ChunkMatch] = []
-        still_unmatched_a: list[Chunk] = []
-
-        # Collect all texts for a single batch embed at the end
-        _pending_semantic: list[tuple[Chunk, Chunk, float]] = []  # (a, b, fuzzy)
-
-        for chunk_a in unmatched_a:
-            best_score = 0.0
-            best_b: Chunk | None = None
-
-            for chunk_b in unmatched_b:
-                if chunk_b.chunk_id in matched_b_ids:
-                    continue
-                score = fuzz.token_sort_ratio(chunk_a.text, chunk_b.text) / 100.0
-                if score > best_score:
-                    best_score = score
-                    best_b = chunk_b
-
-            if best_b is None:
-                still_unmatched_a.append(chunk_a)
-                continue
-
-            if best_score >= self.cfg.fuzzy_exact_threshold:
-                # Pre-check: critical value changes override near-exact
-                # (skip for administrative chunks — dates, revisions, deadlines)
-                if not is_administrative_chunk(chunk_a.text, best_b.text):
-                    crit = detect_critical_value_changes(chunk_a.text, best_b.text)
-                else:
-                    crit = {"has_critical_change": False}
-                if crit["has_critical_change"]:
-                    # Route to semantic batch for proper scoring
-                    _pending_semantic.append((chunk_a, best_b, best_score))
-                else:
-                    matches.append(ChunkMatch(
-                        chunk_a=chunk_a,
-                        chunk_b=best_b,
-                        change_type=ChangeType.NEAR_EXACT,
-                        similarity_score=best_score,
-                        fuzzy_score=best_score,
-                    ))
-                matched_b_ids.add(best_b.chunk_id)
-            elif best_score >= self.cfg.fuzzy_change_low:
-                # Claim the pair — will be semantically re-scored below
-                _pending_semantic.append((chunk_a, best_b, best_score))
-                matched_b_ids.add(best_b.chunk_id)
-            else:
-                still_unmatched_a.append(chunk_a)
-
-        # --- Semantic re-scoring for fuzzy-claimed pairs -----------------
-        if _pending_semantic:
-            all_texts = [t for pair in _pending_semantic for t in (pair[0].text, pair[1].text)]
-            all_embeds = self._embed_batch(all_texts)
-
-            for idx, (chunk_a, best_b, fuzzy_score) in enumerate(_pending_semantic):
-                emb_a = all_embeds[idx * 2]
-                emb_b = all_embeds[idx * 2 + 1]
-                sem_score = float(np.dot(emb_a, emb_b))  # already normalised
-
-                crit_changes = _extract_critical_info_changes(chunk_a.text, best_b.text)
-
-                # Gate: skip critical override for administrative chunks
-                if not is_administrative_chunk(chunk_a.text, best_b.text):
-                    crit = detect_critical_value_changes(chunk_a.text, best_b.text)
-                else:
-                    crit = {"has_critical_change": False}
-
-                # DECISION TREE — first match wins:
-
-                # 1. Critical value change → SEMANTICALLY_DIFFERENT
-                #    regardless of fuzzy or semantic score.
-                if crit["has_critical_change"]:
-                    sem_type, summary = generate_reason(sem_score, fuzzy_score, crit_detail=crit['detail'])
-                    sem_analysis = SemanticAnalysis(
-                        change_type=sem_type,
-                        confidence=round(sem_score, 3),
-                        summary=summary,
-                    )
-                    matches.append(ChunkMatch(
-                        chunk_a=chunk_a,
-                        chunk_b=best_b,
-                        change_type=ChangeType.SEMANTIC_DIFFERENT,
-                        similarity_score=sem_score,
-                        fuzzy_score=fuzzy_score,
-                        semantic_score=sem_score,
-                        semantic_analysis=sem_analysis,
-                        critical_info_changes=crit_changes,
-                    ))
-
-                # 2. High semantic + no critical → SEMANTIC (meaning preserved)
-                elif sem_score >= self.cfg.fuzzy_semantic_reclass_threshold:
-                    sem_type, summary = generate_reason(sem_score, fuzzy_score)
-                    sem_analysis = SemanticAnalysis(
-                        change_type=sem_type,
-                        confidence=round(sem_score, 3),
-                        summary=summary,
-                    )
-                    matches.append(ChunkMatch(
-                        chunk_a=chunk_a,
-                        chunk_b=best_b,
-                        change_type=ChangeType.SEMANTIC,
-                        similarity_score=sem_score,
-                        fuzzy_score=fuzzy_score,
-                        semantic_score=sem_score,
-                        semantic_analysis=sem_analysis,
-                        critical_info_changes=crit_changes,
-                    ))
-
-                # 3. Moderate semantic → SEMANTICALLY_DIFFERENT
-                elif sem_score >= self.cfg.semantic_change_low:
-                    sem_type, summary = generate_reason(sem_score, fuzzy_score)
-                    sem_analysis = SemanticAnalysis(
-                        change_type=sem_type,
-                        confidence=round(sem_score, 3),
-                        summary=summary,
-                    )
-                    matches.append(ChunkMatch(
-                        chunk_a=chunk_a,
-                        chunk_b=best_b,
-                        change_type=ChangeType.SEMANTIC_DIFFERENT,
-                        similarity_score=sem_score,
-                        fuzzy_score=fuzzy_score,
-                        semantic_score=sem_score,
-                        semantic_analysis=sem_analysis,
-                        critical_info_changes=crit_changes,
-                    ))
-
-                # 4. Low semantic → MODIFIED
-                else:
-                    sem_type, summary = generate_reason(sem_score, fuzzy_score, is_modified=True, is_cosine_only=False)
-                    sem_analysis = SemanticAnalysis(
-                        change_type=sem_type,
-                        confidence=round(fuzzy_score, 3),
-                        summary=summary,
-                    )
-                    matches.append(ChunkMatch(
-                        chunk_a=chunk_a,
-                        chunk_b=best_b,
-                        change_type=ChangeType.MODIFIED,
-                        similarity_score=fuzzy_score,
-                        fuzzy_score=fuzzy_score,
-                        semantic_score=sem_score,
-                        semantic_analysis=sem_analysis,
-                    ))
-
-        matched_b_texts = {m.chunk_b.text for m in matches if m.chunk_b}
-        still_unmatched_b = [c for c in unmatched_b if c.text not in matched_b_texts]
-
-        logger.debug(
-            "Fuzzy: %d matched, %d remain_a, %d remain_b",
-            len(matches), len(still_unmatched_a), len(still_unmatched_b)
-        )
-        return matches, still_unmatched_a, still_unmatched_b
-
-    # ------------------------------------------------------------------
-    # Stage 3: semantic matching
-    # ------------------------------------------------------------------
-
     def _embed_batch(self, texts: list[str]) -> np.ndarray:
         model = _get_model()
         return model.encode(
@@ -761,149 +544,14 @@ class MatchingEngine:
             batch_size=self.embed_cfg.batch_size,
             show_progress_bar=False,
             convert_to_numpy=True,
-            normalize_embeddings=True,   # pre-normalize → dot product = cosine
+            normalize_embeddings=True,
         )
 
-    def _semantic_match(
-        self,
-        unmatched_a: list[Chunk],
-        unmatched_b: list[Chunk],
-    ) -> tuple[list[ChunkMatch], list[Chunk], list[Chunk]]:
-        if not unmatched_a or not unmatched_b:
-            return [], unmatched_a, unmatched_b
-
-        texts_a = [c.text for c in unmatched_a]
-        texts_b = [c.text for c in unmatched_b]
-
-        # Single batched encode call
-        all_texts = texts_a + texts_b
-        all_embeds = self._embed_batch(all_texts)
-        embeds_a = all_embeds[:len(texts_a)]
-        embeds_b = all_embeds[len(texts_a):]
-
-        # Similarity matrix via vectorised dot product (already normalised)
-        sim_matrix = embeds_a @ embeds_b.T   # shape (|a|, |b|)
-
-        matched_b_indices: set[int] = set()
-        matches: list[ChunkMatch] = []
-        still_unmatched_a: list[Chunk] = []
-
-        for i, chunk_a in enumerate(unmatched_a):
-            row = sim_matrix[i].copy()
-            # Mask already-matched B chunks
-            for j in matched_b_indices:
-                row[j] = -1.0
-
-            best_j = int(np.argmax(row))
-            best_score = float(row[best_j])
-
-            fuzzy_score = fuzz.token_sort_ratio(chunk_a.text, unmatched_b[best_j].text) / 100.0
-
-            if best_score >= self.cfg.semantic_similar_threshold:
-                # High semantic similarity — but still check for critical value changes
-                # (skip for administrative chunks)
-                if not is_administrative_chunk(chunk_a.text, unmatched_b[best_j].text):
-                    crit = detect_critical_value_changes(chunk_a.text, unmatched_b[best_j].text)
-                else:
-                    crit = {"has_critical_change": False}
-                crit_changes = _extract_critical_info_changes(
-                    chunk_a.text, unmatched_b[best_j].text
-                )
-
-                if crit["has_critical_change"]:
-                    # Critical override → SEMANTICALLY_DIFFERENT
-                    sem_type, summary = generate_reason(best_score, fuzzy_score, crit_detail=crit['detail'])
-                    sem_analysis = SemanticAnalysis(
-                        change_type=sem_type,
-                        confidence=round(best_score, 3),
-                        summary=summary,
-                    )
-                    matches.append(ChunkMatch(
-                        chunk_a=chunk_a,
-                        chunk_b=unmatched_b[best_j],
-                        change_type=ChangeType.SEMANTIC_DIFFERENT,
-                        similarity_score=best_score,
-                        fuzzy_score=fuzzy_score,
-                        semantic_score=best_score,
-                        semantic_analysis=sem_analysis,
-                        critical_info_changes=crit_changes,
-                    ))
-                else:
-                    # No critical change → SEMANTIC (meaning preserved)
-                    sem_type, summary = generate_reason(best_score, fuzzy_score)
-                    sem_analysis = SemanticAnalysis(
-                        change_type=sem_type,
-                        confidence=round(best_score, 3),
-                        summary=summary,
-                    )
-                    matches.append(ChunkMatch(
-                        chunk_a=chunk_a,
-                        chunk_b=unmatched_b[best_j],
-                        change_type=ChangeType.SEMANTIC,
-                        similarity_score=best_score,
-                        fuzzy_score=fuzzy_score,
-                        semantic_score=best_score,
-                        semantic_analysis=sem_analysis,
-                    ))
-                matched_b_indices.add(best_j)
-            elif best_score >= 0.45:
-                # Moderate semantic similarity → MODIFIED
-                sem_type, summary = generate_reason(best_score, fuzzy_score, is_modified=True, is_cosine_only=True)
-                sem_analysis = SemanticAnalysis(
-                    change_type=sem_type,
-                    confidence=round(best_score, 3),
-                    summary=summary,
-                )
-                crit_changes = _extract_critical_info_changes(
-                    chunk_a.text, unmatched_b[best_j].text
-                )
-                matches.append(ChunkMatch(
-                    chunk_a=chunk_a,
-                    chunk_b=unmatched_b[best_j],
-                    change_type=ChangeType.MODIFIED,
-                    similarity_score=best_score,
-                    fuzzy_score=fuzzy_score,
-                    semantic_score=best_score,
-                    semantic_analysis=sem_analysis,
-                ))
-                matched_b_indices.add(best_j)
-            elif best_score >= self.cfg.semantic_contradiction_threshold:
-                # < 0.45 -> SEMANTICALLY_DIFFERENT
-                sem_type, summary = generate_reason(best_score, fuzzy_score)
-                sem_analysis = SemanticAnalysis(
-                    change_type=sem_type,
-                    confidence=round(best_score, 3),
-                    summary=summary,
-                )
-                crit_changes = _extract_critical_info_changes(
-                    chunk_a.text, unmatched_b[best_j].text
-                )
-                matches.append(ChunkMatch(
-                    chunk_a=chunk_a,
-                    chunk_b=unmatched_b[best_j],
-                    change_type=ChangeType.SEMANTIC_DIFFERENT,
-                    similarity_score=best_score,
-                    fuzzy_score=fuzzy_score,
-                    semantic_score=best_score,
-                    semantic_analysis=sem_analysis,
-                    critical_info_changes=crit_changes,
-                ))
-                matched_b_indices.add(best_j)
-            else:
-                still_unmatched_a.append(chunk_a)
-
-        matched_b_set = {unmatched_b[j].chunk_id for j in matched_b_indices}
-        still_unmatched_b = [c for c in unmatched_b if c.chunk_id not in matched_b_set]
-
-        logger.debug(
-            "Semantic: %d matched, %d remain_a, %d remain_b",
-            len(matches), len(still_unmatched_a), len(still_unmatched_b)
-        )
-        return matches, still_unmatched_a, still_unmatched_b
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    def _is_table(self, chunk: Chunk) -> bool:
+        if getattr(chunk, "source", "") == "table":
+            return True
+        text = chunk.text.strip()
+        return text.startswith("Item |") or (" | " in text and text.count(" | ") >= 2)
 
     def match(
         self,
@@ -911,35 +559,227 @@ class MatchingEngine:
         chunks_b: list[Chunk],
     ) -> list[ChunkMatch]:
         """
-        Run the full cascade and return all ChunkMatch objects including
-        ADDED (only in B) and REMOVED (only in A).
+        Run combined single-pass matching for Bug 1, 2, 3 fixes.
         """
         all_matches: list[ChunkMatch] = []
+        if not chunks_a and not chunks_b:
+            return all_matches
 
-        # Stage 1
-        exact_matches, unmatched_a, unmatched_b = self._hash_match(chunks_a, chunks_b)
-        all_matches.extend(exact_matches)
+        texts_a = [c.text for c in chunks_a]
+        texts_b = [c.text for c in chunks_b]
+        all_texts = texts_a + texts_b
+        
+        all_embeds = np.array([])
+        if all_texts:
+            all_embeds = self._embed_batch(all_texts)
+            
+        embeds_a = all_embeds[:len(texts_a)] if len(texts_a) > 0 else np.array([])
+        embeds_b = all_embeds[len(texts_a):] if len(texts_b) > 0 else np.array([])
 
-        # Stage 2
-        fuzzy_matches, unmatched_a, unmatched_b = self._fuzzy_match(unmatched_a, unmatched_b)
-        all_matches.extend(fuzzy_matches)
+        sim_matrix = np.array([])
+        if len(texts_a) > 0 and len(texts_b) > 0:
+            sim_matrix = embeds_a @ embeds_b.T
 
-        # Stage 3
-        sem_matches, unmatched_a, unmatched_b = self._semantic_match(unmatched_a, unmatched_b)
-        all_matches.extend(sem_matches)
+        matched_b_indices: set[int] = set()
+        unmatched_a_indices: list[int] = []
 
-        # Remaining unmatched_a → REMOVED
-        for chunk in unmatched_a:
-            all_matches.append(ChunkMatch(
-                chunk_a=chunk,
-                chunk_b=None,
-                change_type=ChangeType.REMOVED,
-                similarity_score=0.0,
-            ))
+        # Stage 1: Find best match for each chunk in A
+        for i, chunk_a in enumerate(chunks_a):
+            if len(chunks_b) == 0:
+                unmatched_a_indices.append(i)
+                continue
 
-        # Remaining unmatched_b → ADDED
-        for chunk in unmatched_b:
-            # Represent as chunk_a = placeholder, chunk_b = new content
+            best_j = -1
+            best_combined_score = -1.0
+            best_fuzzy = 0.0
+            best_sem = 0.0
+
+            is_table_a = self._is_table(chunk_a)
+            row = sim_matrix[i]
+
+            for j, chunk_b in enumerate(chunks_b):
+                if j in matched_b_indices:
+                    continue
+
+                sem_score = float(row[j])
+                is_table_b = self._is_table(chunk_b)
+                is_table = is_table_a or is_table_b
+
+                if is_table:
+                    # Bug 2: For tables, ignore fuzzy score. Combined score IS semantic score.
+                    fuzzy_score = 0.0
+                    combined_score = sem_score
+                else:
+                    # Bug 1: Combined score
+                    fuzzy_score = fuzz.token_sort_ratio(chunk_a.text, chunk_b.text) / 100.0
+                    combined_score = (fuzzy_score * 0.4) + (sem_score * 0.6)
+
+                if combined_score > best_combined_score:
+                    best_combined_score = combined_score
+                    best_fuzzy = fuzzy_score
+                    best_sem = sem_score
+                    best_j = j
+
+            if best_j == -1:
+                unmatched_a_indices.append(i)
+                continue
+
+            chunk_b = chunks_b[best_j]
+            is_table = is_table_a or self._is_table(chunk_b)
+
+            if is_table:
+                # Bug 2 logic
+                if best_sem >= 0.50:
+                    matched_b_indices.add(best_j)
+                    change_type = ChangeType.EXACT if chunk_a.text == chunk_b.text else ChangeType.MODIFIED
+                    
+                    sem_type, summary = generate_reason(best_sem, best_fuzzy, is_modified=True)
+                    sem_analysis = SemanticAnalysis(
+                        change_type=sem_type,
+                        confidence=round(best_sem, 3),
+                        summary="Table matched by semantic similarity.",
+                    )
+                    crit_changes = _extract_critical_info_changes(chunk_a.text, chunk_b.text)
+                    all_matches.append(ChunkMatch(
+                        chunk_a=chunk_a,
+                        chunk_b=chunk_b,
+                        change_type=change_type,
+                        similarity_score=best_sem,
+                        fuzzy_score=best_fuzzy,
+                        semantic_score=best_sem,
+                        semantic_analysis=sem_analysis if change_type != ChangeType.EXACT else None,
+                        critical_info_changes=crit_changes,
+                    ))
+                else:
+                    unmatched_a_indices.append(i)
+            else:
+                # Bug 1 logic
+                if best_combined_score >= self.cfg.fuzzy_exact_threshold:
+                    matched_b_indices.add(best_j)
+                    if not is_administrative_chunk(chunk_a.text, chunk_b.text):
+                        crit = detect_critical_value_changes(chunk_a.text, chunk_b.text)
+                    else:
+                        crit = {"has_critical_change": False}
+
+                    crit_changes = _extract_critical_info_changes(chunk_a.text, chunk_b.text)
+                    
+                    if crit["has_critical_change"]:
+                        sem_type, summary = generate_reason(best_sem, best_fuzzy, crit_detail=crit['detail'])
+                        sem_analysis = SemanticAnalysis(
+                            change_type=sem_type,
+                            confidence=round(best_combined_score, 3),
+                            summary=summary,
+                        )
+                        all_matches.append(ChunkMatch(
+                            chunk_a=chunk_a,
+                            chunk_b=chunk_b,
+                            change_type=ChangeType.SEMANTIC_DIFFERENT,
+                            similarity_score=best_combined_score,
+                            fuzzy_score=best_fuzzy,
+                            semantic_score=best_sem,
+                            semantic_analysis=sem_analysis,
+                            critical_info_changes=crit_changes,
+                        ))
+                    else:
+                        all_matches.append(ChunkMatch(
+                            chunk_a=chunk_a,
+                            chunk_b=chunk_b,
+                            change_type=ChangeType.EXACT if chunk_a.text == chunk_b.text else ChangeType.NEAR_EXACT,
+                            similarity_score=best_combined_score,
+                            fuzzy_score=best_fuzzy,
+                            semantic_score=best_sem,
+                        ))
+
+                elif best_combined_score >= 0.45:
+                    matched_b_indices.add(best_j)
+                    sem_type, summary = generate_reason(best_sem, best_fuzzy, is_modified=True)
+                    sem_analysis = SemanticAnalysis(
+                        change_type=sem_type,
+                        confidence=round(best_combined_score, 3),
+                        summary=summary,
+                    )
+                    crit_changes = _extract_critical_info_changes(chunk_a.text, chunk_b.text)
+                    all_matches.append(ChunkMatch(
+                        chunk_a=chunk_a,
+                        chunk_b=chunk_b,
+                        change_type=ChangeType.MODIFIED,
+                        similarity_score=best_combined_score,
+                        fuzzy_score=best_fuzzy,
+                        semantic_score=best_sem,
+                        semantic_analysis=sem_analysis,
+                        critical_info_changes=crit_changes,
+                    ))
+                else:
+                    unmatched_a_indices.append(i)
+
+        # Stage 2: Final sweep for REMOVED chunks (Bug 3)
+        unmatched_b_list = [j for j in range(len(chunks_b)) if j not in matched_b_indices]
+
+        for i in unmatched_a_indices:
+            chunk_a = chunks_a[i]
+
+            if not unmatched_b_list:
+                all_matches.append(ChunkMatch(
+                    chunk_a=chunk_a,
+                    chunk_b=None,
+                    change_type=ChangeType.REMOVED,
+                    similarity_score=0.0,
+                ))
+                continue
+
+            best_j_idx = -1
+            best_sem = -1.0
+            row = sim_matrix[i]
+
+            for idx, j in enumerate(unmatched_b_list):
+                sem_score = float(row[j])
+                if sem_score > best_sem:
+                    best_sem = sem_score
+                    best_j_idx = idx
+
+            j = unmatched_b_list[best_j_idx]
+            chunk_b = chunks_b[j]
+
+            if best_sem >= 0.40:
+                matched_b_indices.add(j)
+                unmatched_b_list.pop(best_j_idx)
+
+                fuzzy_score = fuzz.token_sort_ratio(chunk_a.text, chunk_b.text) / 100.0
+                combined_score = (fuzzy_score * 0.4) + (best_sem * 0.6)
+                
+                change_type = ChangeType.MODIFIED
+                if combined_score >= self.cfg.fuzzy_exact_threshold:
+                    change_type = ChangeType.NEAR_EXACT
+
+                sem_type, summary = generate_reason(best_sem, fuzzy_score, is_modified=True)
+                sem_analysis = SemanticAnalysis(
+                    change_type=sem_type,
+                    confidence=round(best_sem, 3),
+                    summary=summary,
+                )
+                crit_changes = _extract_critical_info_changes(chunk_a.text, chunk_b.text)
+                
+                all_matches.append(ChunkMatch(
+                    chunk_a=chunk_a,
+                    chunk_b=chunk_b,
+                    change_type=change_type,
+                    similarity_score=combined_score,
+                    fuzzy_score=fuzzy_score,
+                    semantic_score=best_sem,
+                    semantic_analysis=sem_analysis,
+                    critical_info_changes=crit_changes,
+                ))
+            else:
+                all_matches.append(ChunkMatch(
+                    chunk_a=chunk_a,
+                    chunk_b=None,
+                    change_type=ChangeType.REMOVED,
+                    similarity_score=0.0,
+                ))
+
+        # Stage 3: Remaining B chunks are ADDED
+        for j in unmatched_b_list:
+            chunk = chunks_b[j]
             placeholder = Chunk(
                 chunk_id=f"placeholder_{chunk.chunk_id}",
                 section_index=chunk.section_index,

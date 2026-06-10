@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class MatchingConfig:
     # A fuzzy ratio >= this value is treated as a "near-exact" match
-    fuzzy_exact_threshold: float = 0.95
+    fuzzy_exact_threshold: float = 0.90
 
     # A fuzzy ratio in [fuzzy_change_low, fuzzy_exact_threshold) means "modified".
     # Raised from 0.60 → 0.75 so that loosely-similar chunks fall through to the

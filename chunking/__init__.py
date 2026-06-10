@@ -87,7 +87,12 @@ class HybridChunker:
                 if len(para.strip()) == 0:
                     continue  # skip empty
 
-                sub_parts = _split_long_para(para)
+                is_table = para.strip().startswith("Item |") or (" | " in para and para.count(" | ") >= 2)
+                if is_table:
+                    sub_parts = [para]
+                else:
+                    sub_parts = _split_long_para(para)
+
                 for sp_idx, part in enumerate(sub_parts):
                     part = part.strip()
                     if not part:
@@ -100,7 +105,7 @@ class HybridChunker:
                         section_index=sec_idx,
                         section_heading=heading,
                         text=part,
-                        source="paragraph",
+                        source="table" if is_table else "paragraph",
                     ))
 
             # --- Lists ---------------------------------------------------

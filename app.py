@@ -276,16 +276,12 @@ with tab_upload:
             progress.progress(30, text="📖 Extracting Document B…")
             doc_b = extractor.extract(bytes_b, file_b.name)
 
-            progress.progress(50, text="🔍 Normalising & chunking…")
-            from normalization import DocumentNormalizer
+            progress.progress(50, text="🔍 Chunking…")
             from chunking import HybridChunker
 
-            normalizer = DocumentNormalizer()
             chunker = HybridChunker()
-            norm_a = normalizer.normalize(doc_a)
-            norm_b = normalizer.normalize(doc_b)
-            chunks_a = chunker.chunk(norm_a)
-            chunks_b = chunker.chunk(norm_b)
+            chunks_a = chunker.chunk(doc_a)
+            chunks_b = chunker.chunk(doc_b)
 
             progress.progress(65, text=f"⚡ Matching {len(chunks_a) + len(chunks_b)} chunks…")
             from matching import MatchingEngine
@@ -319,11 +315,11 @@ with tab_upload:
             )
 
             # Build section-level diffs
-            section_diffs = build_section_diffs(norm_a, norm_b, matches)
+            section_diffs = build_section_diffs(doc_a, doc_b, matches)
 
             st.session_state.report = report
-            st.session_state.doc_a = norm_a
-            st.session_state.doc_b = norm_b
+            st.session_state.doc_a = doc_a
+            st.session_state.doc_b = doc_b
             st.session_state.section_diffs = section_diffs
             st.session_state.json_report = generate_json_report(report)
             st.session_state.html_report = generate_html_report(report)

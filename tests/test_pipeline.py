@@ -24,7 +24,6 @@ from models import (
     Table,
     ChangeType,
 )
-from normalization import DocumentNormalizer, normalize_text
 from chunking import HybridChunker
 from matching import MatchingEngine, _sha256
 from reporting import generate_json_report, generate_html_report
@@ -85,37 +84,6 @@ def simple_doc_b():
     ])
 
 
-# ---------------------------------------------------------------------------
-# Normalization tests
-# ---------------------------------------------------------------------------
-
-class TestNormalization:
-    def test_unicode_nfc(self):
-        # Combining accent → precomposed
-        text = "cafe\u0301"   # 'e' + combining acute
-        result = normalize_text(text)
-        assert result == "café"
-
-    def test_whitespace_collapse(self):
-        text = "hello    world\n\n\n\nbye"
-        result = normalize_text(text)
-        assert "    " not in result
-        assert result.count("\n") <= 2
-
-    def test_smart_quotes(self):
-        text = "\u201cHello\u201d and \u2018world\u2019"
-        result = normalize_text(text)
-        assert '"' in result or "'" in result
-        assert "\u201c" not in result
-
-    def test_document_normalizer(self, simple_doc_a):
-        norm = DocumentNormalizer()
-        result = norm.normalize(simple_doc_a)
-        assert len(result.sections) == len(simple_doc_a.sections)
-        for sec in result.sections:
-            for para in sec.paragraphs:
-                assert para == para.strip()
-
 
 # ---------------------------------------------------------------------------
 # Chunking tests
@@ -124,36 +92,31 @@ class TestNormalization:
 class TestChunking:
     def test_produces_chunks(self, simple_doc_a):
         chunker = HybridChunker()
-        norm = DocumentNormalizer().normalize(simple_doc_a)
-        chunks = chunker.chunk(norm)
+        chunks = chunker.chunk(simple_doc_a)
         assert len(chunks) > 0
 
     def test_chunk_ids_unique(self, simple_doc_a):
         chunker = HybridChunker()
-        norm = DocumentNormalizer().normalize(simple_doc_a)
-        chunks = chunker.chunk(norm)
+        chunks = chunker.chunk(simple_doc_a)
         ids = [c.chunk_id for c in chunks]
         assert len(ids) == len(set(ids)), "Chunk IDs must be unique"
 
     def test_chunk_text_not_empty(self, simple_doc_a):
         chunker = HybridChunker()
-        norm = DocumentNormalizer().normalize(simple_doc_a)
-        chunks = chunker.chunk(norm)
+        chunks = chunker.chunk(simple_doc_a)
         for c in chunks:
             assert c.text.strip(), f"Empty chunk: {c.chunk_id}"
 
     def test_section_heading_preserved(self, simple_doc_a):
         chunker = HybridChunker()
-        norm = DocumentNormalizer().normalize(simple_doc_a)
-        chunks = chunker.chunk(norm)
+        chunks = chunker.chunk(simple_doc_a)
         heading_chunks = [c for c in chunks if c.source == "heading"]
         assert any("Introduction" in c.text for c in heading_chunks)
 
     def test_list_chunks(self):
         doc = _make_doc([{"heading": "Items", "lists": [["Alpha", "Beta", "Gamma"]]}])
         chunker = HybridChunker()
-        norm = DocumentNormalizer().normalize(doc)
-        chunks = chunker.chunk(norm)
+        chunks = chunker.chunk(doc)
         list_chunks = [c for c in chunks if c.source == "list"]
         assert len(list_chunks) == 1
         assert "Alpha" in list_chunks[0].text
@@ -296,17 +259,13 @@ class TestReporting:
 
 class TestIntegration:
     def test_txt_comparison(self, simple_doc_a, simple_doc_b):
-        from normalization import DocumentNormalizer
         from chunking import HybridChunker
 
-        norm = DocumentNormalizer()
         chunker = HybridChunker()
         engine = MatchingEngine()
 
-        na = norm.normalize(simple_doc_a)
-        nb = norm.normalize(simple_doc_b)
-        ca = chunker.chunk(na)
-        cb = chunker.chunk(nb)
+        ca = chunker.chunk(simple_doc_a)
+        cb = chunker.chunk(simple_doc_b)
         matches = engine.match(ca, cb)
 
         assert len(matches) > 0

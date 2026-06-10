@@ -41,6 +41,11 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+def clean_text(text: str) -> str:
+    import re
+    text = re.sub(r'[ \t]+', ' ', text)
+    return text.strip()
+
 def _word_count(text: str) -> int:
     return len(text.split())
 

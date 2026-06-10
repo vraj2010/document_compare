@@ -31,7 +31,6 @@ from models import (
 )
 from config import CONFIG
 from extraction import DocumentExtractor
-from normalization import DocumentNormalizer
 from chunking import HybridChunker
 from matching import MatchingEngine
 
@@ -93,7 +92,6 @@ class ComparisonEngine:
 
     def __init__(self):
         self.extractor = DocumentExtractor()
-        self.normalizer = DocumentNormalizer()
         self.chunker = HybridChunker()
         self.matcher = MatchingEngine()
 
@@ -107,13 +105,9 @@ class ComparisonEngine:
         """
         t0 = time.perf_counter()
 
-        # Normalise
-        norm_a = self.normalizer.normalize(doc_a)
-        norm_b = self.normalizer.normalize(doc_b)
-
         # Chunk
-        chunks_a = self.chunker.chunk(norm_a)
-        chunks_b = self.chunker.chunk(norm_b)
+        chunks_a = self.chunker.chunk(doc_a)
+        chunks_b = self.chunker.chunk(doc_b)
 
         logger.info("Chunks: A=%d, B=%d", len(chunks_a), len(chunks_b))
 
