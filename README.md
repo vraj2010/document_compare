@@ -40,14 +40,11 @@ document_compare/
 ├── extraction/
 │   └── extractor.py         # Docling-first extractor with fallbacks for PDF/DOCX/TXT
 │
-├── normalization/
-│   └── __init__.py          # Unicode, whitespace, punctuation, heading, table normalisation
-│
 ├── chunking/
-│   └── __init__.py          # Hybrid section+paragraph chunker
+│   └── __init__.py          # Hybrid section+paragraph chunker with intact table chunks
 │
 ├── matching/
-│   └── __init__.py          # 3-stage cascade: Hash → Fuzzy → Semantic
+│   └── __init__.py          # Single-pass Combined Score Matching Engine
 │
 ├── comparison/
 │   └── __init__.py          # Pipeline orchestrator → ComparisonReport
@@ -93,17 +90,13 @@ Document
 Every downstream stage consumes this model — it is the contract between
 extraction and comparison.
 
-### 3 · Normalization
+### 3 · Text Cleaning
 
-Five passes applied before any comparison to reduce noise:
+Instead of a heavy normalization layer, a highly optimized cleaning pass is applied:
+- Replaces all tabs and multiple spaces with a single space.
+- Strips leading and trailing whitespace.
 
-| Pass | What it does |
-|------|-------------|
-| Unicode NFC | Collapses combining characters to precomposed forms |
-| Whitespace | Collapses runs of spaces/tabs; limits blank lines |
-| Punctuation | Smart quotes, em-dashes, NBSP → ASCII equivalents |
-| Heading | Strips trailing punctuation, normalises case |
-| Table | Lowercases headers, trims all cells |
+This prevents false `MODIFIED` flags caused by arbitrary PDF character spacing artifacts.
 
 ### 4 · Chunking Strategy — Hybrid Section + Paragraph
 
@@ -115,37 +108,30 @@ fine-grained diffs impossible.
 Requires a full embedding pass just to split — expensive and circular.
 
 **Hybrid approach:**
-1. Split at section boundaries (preserves document structure)
-2. Sub-split paragraphs if accumulated tokens exceed `max_chunk_tokens` (default 300)
-3. Tables and lists each become their own chunk
+1. Split at section boundaries (preserves document structure).
+2. Sub-split paragraphs if accumulated tokens exceed `max_chunk_tokens` (default 300).
+3. Tables and lists each become their own isolated chunk (tables are never split to preserve formatting).
 
 Result: ~400-600 chunks for a 50-page document, chunking time < 50 ms.
 
-### 5 · Three-Stage Matching Cascade
+### 5 · Combined-Score Matching Engine
 
-```
-For each chunk in A:
-  1. SHA-256 hash lookup in B  →  Exact Match  (0 embeddings)
-     ↓ miss
-  2. RapidFuzz token_sort_ratio  →  Near-Exact / Modified  (0 embeddings)
-     ↓ miss
-  3. SentenceTransformer cosine  →  Semantic / Unrelated  (batch embedding)
-```
+Instead of a rigid cascade, the matching engine uses an `O(|A| x |B|)` single-pass loop calculating a combined fuzzy and semantic score:
 
-**Why this order?**  
-Stages 1 and 2 are essentially free (microseconds). In a typical contract
-or report document, 60-80% of chunks are unchanged boilerplate — they never
-reach Stage 3. This means the expensive embedding model handles only a
-small fraction of chunks.
+**For Standard Chunks:**
+- `combined_score = (fuzzy_score * 0.4) + (semantic_score * 0.6)`
+- Score `>= fuzzy_exact_threshold`: Marked `EXACT` or `NEAR_EXACT`
+- Score `>= 0.45` and `< fuzzy_exact_threshold`: Marked `MODIFIED`
+- Score `< 0.45`: Unmatched (Temporarily marked `REMOVED`)
 
-**Batch embedding:**  
-All Stage-3 candidates are embedded in a single `model.encode()` call,
-which saturates CPU/GPU efficiently via batching.
+**For Table Chunks:**
+- Tables (detected via column counts or `Item |` patterns) completely bypass fuzzy scoring, using ONLY semantic similarity.
+- Score `>= 0.50`: Marked `MODIFIED` (or `EXACT` if text matches perfectly).
+- This prevents minor table layout differences from causing large penalty drops.
 
-**Nearest-neighbour matching:**  
-Similarity matrix computed as `embeds_a @ embeds_b.T` (vectorised dot
-product on pre-normalised embeddings = cosine similarity). No `faiss`
-dependency needed for documents under ~1000 chunks.
+**Final Sweep for `REMOVED` Chunks:**
+- Before solidifying a chunk as `REMOVED`, a final sweep checks it against all remaining unmatched Document B chunks using **only** semantic scoring.
+- If a chunk hits a semantic score of `>= 0.40`, it is rescued and marked `MODIFIED` instead. Unmatched remaining Document B chunks are then officially marked as `ADDED`.
 
 ### 6 · Semantic Change Detection
 
@@ -190,7 +176,7 @@ Settings** expander:
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
-| `fuzzy_exact_threshold` | 0.95 | Above → near-exact match |
+| `fuzzy_exact_threshold` | 0.90 | Above → near-exact match |
 | `semantic_similar_threshold` | 0.82 | Above → same meaning |
 | `max_chunk_tokens` | 300 | Chunk size (lower = finer diffs) |
 
@@ -209,13 +195,13 @@ The semantic embedding tests use pure logic (no model download required).
 
 ## Expected Performance
 
-| Document size | Chunks | Hash stage | Fuzzy stage | Semantic stage | Total |
-|---|---|---|---|---|---|
-| 2-page letter | ~30 | < 1ms | < 5ms | < 200ms | < 300ms |
-| 20-page report | ~200 | < 5ms | < 50ms | < 1s | ~1.5s |
-| 100-page contract | ~800 | < 20ms | < 500ms | ~3s | ~5s |
+| Document size | Chunks | Embeddings | Total Search Time | Total Time |
+|---|---|---|---|---|
+| 2-page letter | ~30 | Batched | < 200ms | < 300ms |
+| 20-page report | ~200 | Batched | < 1s | ~1.5s |
+| 100-page contract | ~800 | Batched | ~3s | ~5s |
 
-*Timings on a modern CPU. GPU reduces semantic stage by ~5×.*
+*Timings on a modern CPU. GPU reduces embedding stage by ~5×.*
 
 ---
 
@@ -224,7 +210,7 @@ The semantic embedding tests use pure logic (no model download required).
 - **GPU acceleration:** Change `device: "cpu"` → `"cuda"` in `config.py`.
 - **Larger documents:** Swap nearest-neighbour with `faiss.IndexFlatIP` for
   sub-linear search above ~2000 chunks.
-- **API mode:** Wrap `ComparisonEngine.compare_bytes()` in a FastAPI endpoint.
+- **API mode:** Wrap `ComparisonEngine.compare_documents()` in a FastAPI endpoint.
 - **Caching:** Already uses `lru_cache`; for persistent caching across restarts
   add `diskcache` without other architectural changes.
 - **Multilingual:** Swap to `paraphrase-multilingual-MiniLM-L12-v2` in config.
